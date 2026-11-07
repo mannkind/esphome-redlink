@@ -1,0 +1,120 @@
+# Compile-only starting point: configure IDs, Wi-Fi and wiring before deployment.
+# Arbitrary demonstration IDs are NOT a working universal RedLINK profile.
+esphome:
+  name: redlink-example
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+logger:
+
+wifi:
+  ssid: "REPLACE_WITH_YOUR_WIFI_SSID"
+  password: "REPLACE_WITH_YOUR_WIFI_PASSWORD"
+
+api:
+  actions:
+    - action: redlink_temporary_hold_until
+      variables:
+        hour: int
+        minute: int
+      then:
+        - lambda: id(redlink_thermostat).temporary_hold_until(hour, minute);
+
+# Local source is intentional for repository builds/CI.
+# README.md shows the Git source for a separate ESPHome configuration.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [redlink]
+
+# Example ESP32-S3 wiring only: match YOUR board and CC1101 module.
+# GPIO45/46 are strapping pins: verify boot levels and external pulls before use.
+# The flags below acknowledge that constraint; they don't change pin behavior.
+spi:
+  clk_pin:
+    number: GPIO45
+    ignore_strapping_warning: true
+  miso_pin:
+    number: GPIO47
+    allow_other_uses: true
+  mosi_pin:
+    number: GPIO46
+    ignore_strapping_warning: true
+  interface: spi3
+
+climate:
+  - platform: redlink
+    id: redlink_thermostat
+    name: RedLINK Thermostat
+    # Hard TX interlock. To opt in, change to false, rebuild/upload, then
+    # deliberately turn on the Transmit Enabled switch (OFF after every boot).
+    receive_only: true
+    cs_pin: GPIO48
+    gdo0_pin: GPIO42
+    miso_pin:
+      number: GPIO47
+      allow_other_uses: true
+    # REQUIRED configuration: these arbitrary examples must be replaced.
+    # Changing IDs alone does not adapt the shipped 0x389e-specific hop map.
+    network_id: 0x1234
+    gateway_id: 0x5678
+    # Experimental hardware defaults, NOT universal/calibrated values.
+    frequency: 904195310
+    tx_advance_us: 800
+    system_mode:
+      name: RedLINK System Mode
+    heat_hold_until:
+      name: RedLINK Heat Hold Until
+    cool_hold_until:
+      name: RedLINK Cool Hold Until
+    emergency_heat:
+      name: RedLINK Emergency Heat
+    result:
+      name: RedLINK Transaction
+    pairing_status:
+      name: RedLINK Pairing Status
+    paired:
+      name: RedLINK Paired
+    acknowledged:
+      name: RedLINK Acknowledged
+    verified:
+      name: RedLINK Readback Verified
+    clock_locked:
+      name: RedLINK Clock Locked
+    radio_healthy:
+      name: RedLINK Radio Healthy
+    command_pending:
+      name: RedLINK Command Pending
+
+switch:
+  - platform: template
+    name: RedLINK Transmit Enabled
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - lambda: id(redlink_thermostat).set_transmit_enabled(true);
+    turn_off_action:
+      - lambda: id(redlink_thermostat).set_transmit_enabled(false);
+
+button:
+  - platform: template
+    name: RedLINK Pair Gateway
+    entity_category: config
+    on_press:
+      - lambda: id(redlink_thermostat).pair_gateway();
+
+  - platform: template
+    name: RedLINK Complete Gateway Association
+    entity_category: config
+    on_press:
+      - lambda: id(redlink_thermostat).complete_gateway_association();
+
+  - platform: template
+    name: RedLINK Refresh Status
+    on_press:
+      - lambda: id(redlink_thermostat).refresh();

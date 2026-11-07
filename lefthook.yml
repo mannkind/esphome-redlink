@@ -1,0 +1,10 @@
+pre-commit:
+  commands:
+    quality:
+      run: bash tools/check.sh
+pre-push:
+  commands:
+    quality:
+      run: bash tools/check.sh
+    host-tests:
+      run: bash tools/test.sh

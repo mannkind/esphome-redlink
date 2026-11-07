@@ -1,0 +1,4 @@
+.esphome/
+.venv/
+node_modules/
+uv.lock
