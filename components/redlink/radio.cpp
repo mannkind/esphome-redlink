@@ -453,13 +453,13 @@ bool RedLinkRadio::read_frame(Frame &frame, uint32_t &sync_start_us) {
     this->begin_rx();
     return valid;
   }
-  if (unread > 1) {
-    const size_t count = std::min(unread - 1, remaining);
-    if (!this->read_fifo_(this->rx_frame_.data.data() + this->rx_frame_.size, count))
-      return false;
-    this->rx_frame_.size += count;
-    this->rx_last_progress_us_ = micros();
-  }
+  if (unread <= 1)
+    return false;
+  const size_t count = std::min(unread - 1, remaining);
+  if (!this->read_fifo_(this->rx_frame_.data.data() + this->rx_frame_.size, count))
+    return false;
+  this->rx_frame_.size += count;
+  this->rx_last_progress_us_ = micros();
   return false;
 }
 

@@ -66,6 +66,7 @@ uvx --from esphome==2026.10.2 esphome compile example.yaml
 
 Hooks check formatting and static analysis on commits and pushes; pushes also
 run the host tests. CI checks both and builds the firmware.
+I prefer early returns over wrapping a function's work in another `if`.
 
 ## Credits
 

@@ -41,8 +41,9 @@ Control merge_control(Control older, const Control &newer) {
 }  // namespace
 
 void RedLinkSystemModeSelect::control(size_t index) {
-  if (index < SYSTEM_MODE_CODES.size())
-    parent_->set_system_mode(SYSTEM_MODE_CODES[index]);
+  if (index >= SYSTEM_MODE_CODES.size())
+    return;
+  parent_->set_system_mode(SYSTEM_MODE_CODES[index]);
 }
 
 void RedLinkSystemModeSelect::publish_mode(uint8_t mode) {
@@ -190,25 +191,28 @@ void RedLinkClimate::listen_for_clock_() {
     }
     listen_slot_(clock_listen_.slot);
     scan_changed_ms_ = now;
-  } else if (now - scan_changed_ms_ >= 15400) {
-    // Cover a complete 61611-tick broadcast period plus its four copies.
-    // Step five slots so search does not follow the EIM's own one-slot progression.
-    listen_slot_((receive_slot_ + 5) % HOP_CHANNELS.size());
-    scan_changed_ms_ = now;
+    return;
   }
+  if (now - scan_changed_ms_ < 15400)
+    return;
+  // Cover a complete 61611-tick broadcast period plus its four copies.
+  // Step five slots so search does not follow the EIM's own one-slot progression.
+  listen_slot_((receive_slot_ + 5) % HOP_CHANNELS.size());
+  scan_changed_ms_ = now;
 }
 
 void RedLinkClimate::set_transmit_enabled(bool enabled) {
   transmit_enabled_ = enabled;
-  if (!enabled) {
-    // A packet already on air cannot be recalled. Do not interrupt TX mid-frame.
-    if (stage_ != Stage::IDLE || have_queued_control_)
-      finish_("Disabled; any transmitted write may have applied", false);
-    else
-      report_("Transmit disabled; passive clock acquisition");
-  } else {
+  if (enabled) {
     refresh();
+    return;
   }
+  // A packet already on air cannot be recalled. Do not interrupt TX mid-frame.
+  if (stage_ != Stage::IDLE || have_queued_control_) {
+    finish_("Disabled; any transmitted write may have applied", false);
+    return;
+  }
+  report_("Transmit disabled; passive clock acquisition");
 }
 
 void RedLinkClimate::on_radio_failure_() {
@@ -259,12 +263,12 @@ bool RedLinkClimate::valid_requested_targets_(const Control &control) const {
     if (candidate.hold == 0) {
       heat = confirmed_status_.complete() ? confirmed_status_.thermostat[17] : -1;
       cool = confirmed_status_.complete() ? confirmed_status_.thermostat[18] : -1;
-    } else {
-      if (candidate.heat != -1)
-        heat = candidate.heat;
-      if (candidate.cool != -1)
-        cool = candidate.cool;
+      return;
     }
+    if (candidate.heat != -1)
+      heat = candidate.heat;
+    if (candidate.cool != -1)
+      cool = candidate.cool;
   };
   // A write already in flight is the baseline for its queue; an unsent request
   // is merged instead, so schedule/target supersession matches admission below.
@@ -319,20 +323,20 @@ void RedLinkClimate::request_control_(const Control &control) {
 }
 
 void RedLinkClimate::refresh() {
-  if (start_(Control{}) && !paired_state_) {
-    stage_ = Stage::CHECK_REGISTRY;
-    registry_confirmed_ = false;
-    report_pairing_("Checking existing gateway registry; no enrollment writes");
-    begin_exchange_(gateway_registry_query(network_, gateway_));
-  }
+  if (!start_(Control{}) || paired_state_)
+    return;
+  stage_ = Stage::CHECK_REGISTRY;
+  registry_confirmed_ = false;
+  report_pairing_("Checking existing gateway registry; no enrollment writes");
+  begin_exchange_(gateway_registry_query(network_, gateway_));
 }
 
 void RedLinkClimate::complete_gateway_association() {
   // Admission must be independently demonstrated before completing its registry entry.
-  if (start_(Control{})) {
-    complete_association_ = true;
-    report_pairing_("Checking actual status before completing association; no registration");
-  }
+  if (!start_(Control{}))
+    return;
+  complete_association_ = true;
+  report_pairing_("Checking actual status before completing association; no registration");
 }
 
 void RedLinkClimate::temporary_hold_until(int hour, int minute) {
@@ -534,30 +538,31 @@ void RedLinkClimate::received_(const Frame &frame, uint32_t sync_us) {
       ESP_LOGI(TAG, "Trace t=%lu ACK stage=%u attempt=%u elapsed=%lu ms", (unsigned long) millis(), unsigned(stage_),
                unsigned(attempts_), (unsigned long) (millis() - transaction_started_ms_));
     }
-  } else if (stage_ != Stage::WRITE && peer_reply(frame, network_, gateway_)) {
-    if (collect_status(frame, received_status_)) {
-      // collect_status validated every block/separator; pending blocks invalidate,
-      // rather than replace, the corresponding accumulated actual status.
-      const size_t end = frame.size - 2;
-      for (size_t position = 11; position < end;) {
-        const uint8_t *block = frame.data.data() + position;
-        const size_t size = (block[0] & 0x7f) + 1;
-        if (size == 31 && (block[1] & 0x3f) == 1 && block[2] == 0xff && block[3] == 0 &&
-            (block[4] == 0x5a || block[4] == 0x9a)) {
-          ESP_LOGI(TAG, "Trace t=%lu status thermostat=%s heat=%u cool=%u stage=%u elapsed=%lu ms",
-                   (unsigned long) millis(), block[4] == 0x5a ? "actual" : "pending", unsigned(block[7]),
-                   unsigned(block[8]), unsigned(stage_), (unsigned long) (millis() - transaction_started_ms_));
-        } else if (size == 10 && (block[1] & 0x3f) == 0x22 && block[2] == 0xc0 && block[3] == 0 &&
-                   (block[4] == 0x45 || block[4] == 0x85)) {
-          ESP_LOGI(TAG, "Trace t=%lu status fan=%s value=%u stage=%u elapsed=%lu ms", (unsigned long) millis(),
-                   block[4] == 0x45 ? "actual" : "pending", unsigned(block[9] & 3), unsigned(stage_),
-                   (unsigned long) (millis() - transaction_started_ms_));
-        }
-        position += size;
-        if (position < end)
-          ++position;
-      }
+    return;
+  }
+  if (stage_ == Stage::WRITE || !peer_reply(frame, network_, gateway_))
+    return;
+  if (!collect_status(frame, received_status_))
+    return;  // collect_status validated every block/separator; pending blocks invalidate,
+  // rather than replace, the corresponding accumulated actual status.
+  const size_t end = frame.size - 2;
+  for (size_t position = 11; position < end;) {
+    const uint8_t *block = frame.data.data() + position;
+    const size_t size = (block[0] & 0x7f) + 1;
+    if (size == 31 && (block[1] & 0x3f) == 1 && block[2] == 0xff && block[3] == 0 &&
+        (block[4] == 0x5a || block[4] == 0x9a)) {
+      ESP_LOGI(TAG, "Trace t=%lu status thermostat=%s heat=%u cool=%u stage=%u elapsed=%lu ms",
+               (unsigned long) millis(), block[4] == 0x5a ? "actual" : "pending", unsigned(block[7]),
+               unsigned(block[8]), unsigned(stage_), (unsigned long) (millis() - transaction_started_ms_));
+    } else if (size == 10 && (block[1] & 0x3f) == 0x22 && block[2] == 0xc0 && block[3] == 0 &&
+               (block[4] == 0x45 || block[4] == 0x85)) {
+      ESP_LOGI(TAG, "Trace t=%lu status fan=%s value=%u stage=%u elapsed=%lu ms", (unsigned long) millis(),
+               block[4] == 0x45 ? "actual" : "pending", unsigned(block[9] & 3), unsigned(stage_),
+               (unsigned long) (millis() - transaction_started_ms_));
     }
+    position += size;
+    if (position < end)
+      ++position;
   }
 }
 
@@ -841,24 +846,26 @@ void RedLinkClimate::loop() {
   }
   // Finish an on-air packet even if the enable switch was just turned off.
   if (exchange_ == Exchange::TX) {
-    if (tx_finished()) {
-      const bool success = tx_succeeded() && !this->is_failed();
-      if (stage_ == Stage::PAIRING)
-        enrollment_.transport_complete(success);
-      begin_rx();
-      if (!success) {
-        if (stage_ != Stage::IDLE)
-          finish_("TX failed; delivery unknown; no further packets sent", false);
-        exchange_ = Exchange::CLOCK;
+    if (!tx_finished()) {
+      if (millis() - tx_started_ms_ < 50)
         return;
-      }
-      window_started_ms_ = millis();
-      exchange_ = Exchange::RX;
-    } else if (millis() - tx_started_ms_ >= 50) {
       begin_rx();
       finish_("TX timeout; delivery unknown", false);
       exchange_ = Exchange::CLOCK;
+      return;
     }
+    const bool success = tx_succeeded() && !this->is_failed();
+    if (stage_ == Stage::PAIRING)
+      enrollment_.transport_complete(success);
+    begin_rx();
+    if (!success) {
+      if (stage_ != Stage::IDLE)
+        finish_("TX failed; delivery unknown; no further packets sent", false);
+      exchange_ = Exchange::CLOCK;
+      return;
+    }
+    window_started_ms_ = millis();
+    exchange_ = Exchange::RX;
     return;
   }
   Frame frame;

@@ -387,10 +387,11 @@ void GatewayEnrollment::transmitted() {
 void GatewayEnrollment::transport_complete(bool success) {
   if (state_ == State::IDLE || state_ == State::COMPLETE || state_ == State::FAILED)
     return;
-  if (!success || attempts_ == 0)
+  if (!success || attempts_ == 0) {
     fail();
-  else
-    transport_ok_ = true;
+    return;
+  }
+  transport_ok_ = true;
 }
 
 void GatewayEnrollment::receive(const Frame &frame) {
@@ -413,23 +414,28 @@ void GatewayEnrollment::finish_window() {
     fail();
     return;
   }
-  if (state_ == State::ANNOUNCE)
+  if (state_ == State::ANNOUNCE) {
     advance_(State::REGISTER);
-  else if (state_ == State::COMMIT) {
+    return;
+  }
+  if (state_ == State::COMMIT) {
     // A drained TX FIFO is not delivery. Retry this idempotent association write
     // within the normal five-attempt bound, then always check the registry.
     if (response_ || attempts_ >= 5)
       advance_(State::VERIFY);
-  } else if (response_) {
-    if (state_ == State::DISCOVER)
-      advance_(State::ANNOUNCE);
-    else if (state_ == State::REGISTER)
-      advance_(State::COMMIT);
-    else if (state_ == State::VERIFY)
-      advance_(State::COMPLETE);
-  } else if (attempts_ >= 5) {
-    fail();
+    return;
   }
+  if (!response_) {
+    if (attempts_ >= 5)
+      fail();
+    return;
+  }
+  if (state_ == State::DISCOVER)
+    advance_(State::ANNOUNCE);
+  else if (state_ == State::REGISTER)
+    advance_(State::COMMIT);
+  else if (state_ == State::VERIFY)
+    advance_(State::COMPLETE);
 }
 
 }  // namespace redlink
