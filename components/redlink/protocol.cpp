@@ -5,20 +5,142 @@
 namespace esphome {
 namespace redlink {
 
-// Fixed experimental hop/sync profile measured on installation network 0x389e.
-// This is not a universal RedLINK map: changing network_id does not discover or
-// derive another installation's profile. Slots 41/43/44 were confirmed by
-// CRC-valid gateway-pairing captures; the remaining entries retain the measured profile.
-const std::array<HopChannel, 50> HOP_CHANNELS{{
-    {10, 0x636e},  {70, 0x6387},  {50, 0x637e},  {111, 0x6397}, {26, 0x6376},  {87, 0x638f},  {58, 0x6382},
-    {119, 0x639b}, {89, 0x6390},  {28, 0x6377},  {91, 0x6391},  {30, 0x6378},  {77, 0x638a},  {16, 0x6371},
-    {14, 0x6370},  {75, 0x6389},  {66, 0x6385},  {6, 0x636c},   {109, 0x6396}, {48, 0x637d},  {73, 0x6388},
-    {12, 0x636f},  {113, 0x6398}, {52, 0x637f},  {62, 0x6384},  {4, 0x636b},   {117, 0x639a}, {56, 0x6381},
-    {115, 0x6399}, {54, 0x6380},  {32, 0x6379},  {93, 0x6392},  {83, 0x638d},  {22, 0x6374},  {97, 0x6394},
-    {44, 0x637b},  {60, 0x6383},  {121, 0x639c}, {99, 0x6395},  {46, 0x637c},  {34, 0x637a},  {95, 0x6393},
-    {18, 0x6372},  {79, 0x638b},  {81, 0x638c},  {20, 0x6373},  {24, 0x6375},  {85, 0x638e},  {8, 0x636d},
-    {68, 0x6386},
-}};
+const std::array<uint8_t, HOP_COUNT> CANDIDATE_CHANNELS{
+    4,  6,  8,  10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 44, 46, 48,  50,  52,  54,  56,  58,  60,
+    62, 66, 68, 70, 73, 75, 77, 79, 81, 83, 85, 87, 89, 91, 93, 95, 97, 99, 109, 111, 113, 115, 117, 119, 121};
+
+HopChannel candidate_channel(uint8_t rank) {
+  if (rank >= HOP_COUNT)
+    return {UNKNOWN_CHANNEL, 0};
+  return {CANDIDATE_CHANNELS[rank], static_cast<uint16_t>(0x636b + rank)};
+}
+
+void HopLearner::reset(bool retain_active) {
+  pending_.fill(UNKNOWN_CHANNEL);
+  observations_.fill(0);
+  counters_.fill(0x1000000);  // Outside the 24-bit counter domain: no observation this epoch.
+  if (!retain_active) {
+    active_.fill(UNKNOWN_CHANNEL);
+    active_valid_ = false;
+  }
+  rebuilding_ = true;
+  conflict_ = false;
+  fresh_count_ = 0;
+  fresh_counter_ = 0;
+}
+
+void HopLearner::restart_clock_epoch() {
+  // A reset/outage invalidates counter ordering, not an already confirmed map.
+  // Single observations lose credit, so replaying one old packet cannot confirm it.
+  counters_.fill(0x1000000);
+  for (auto &count : observations_)
+    if (count < 2)
+      count = 0;
+  fresh_count_ = 0;
+  fresh_counter_ = 0;
+}
+
+uint8_t HopLearner::known() const {
+  return cached()
+             ? HOP_COUNT
+             : std::count_if(pending_.begin(), pending_.end(), [](uint8_t rank) { return rank != UNKNOWN_CHANNEL; });
+}
+
+uint8_t HopLearner::confirmed() const {
+  return cached() && ready() ? HOP_COUNT : std::count(observations_.begin(), observations_.end(), uint8_t(2));
+}
+
+uint8_t HopLearner::rank(uint8_t slot) const {
+  if (slot >= HOP_COUNT)
+    return UNKNOWN_CHANNEL;
+  return cached() ? active_[slot] : pending_[slot];
+}
+
+bool HopLearner::observe(uint8_t slot, uint8_t rank, uint32_t counter, uint32_t observed_ms) {
+  if (slot >= HOP_COUNT || rank >= HOP_COUNT || counter > 0xffffff || conflict_)
+    return false;
+  if ((cached() && active_[slot] != rank) || (pending_[slot] != UNKNOWN_CHANNEL && pending_[slot] != rank)) {
+    conflict_ = true;
+    return false;
+  }
+  for (size_t i = 0; i < HOP_COUNT; ++i) {
+    // Ordering is ambiguous after half of the 24-bit/4096-Hz counter period.
+    if (counters_[i] <= 0xffffff && observed_ms - observed_ms_[i] >= 2048000) {
+      counters_[i] = 0x1000000;
+      if (observations_[i] < 2)
+        observations_[i] = 0;
+    }
+    if (i != slot && (pending_[i] == rank || counters_[i] == counter)) {
+      conflict_ = true;
+      return false;
+    }
+  }
+  // Live reception is ordered. Repeated or older counters never add evidence.
+  const uint32_t delta = (counter - counters_[slot]) & 0xffffff;
+  if (counters_[slot] <= 0xffffff && (delta == 0 || delta >= 0x800000))
+    return false;
+  pending_[slot] = rank;
+  counters_[slot] = counter;
+  observed_ms_[slot] = observed_ms;
+  if (observations_[slot] < 2)
+    ++observations_[slot];
+  if (cached()) {
+    const uint32_t fresh_delta = (counter - fresh_counter_) & 0xffffff;
+    if (fresh_count_ == 0 || (fresh_delta != 0 && fresh_delta < 0x800000)) {
+      fresh_counter_ = counter;
+      if (fresh_count_ < 2)
+        ++fresh_count_;
+    }
+  } else if (confirmed() == HOP_COUNT) {
+    active_ = pending_;
+    active_valid_ = true;
+    rebuilding_ = false;
+    fresh_count_ = 2;
+    fresh_counter_ = counter;
+  }
+  return true;
+}
+
+bool HopLearner::load(const HopMapRecord &record, uint16_t network, uint32_t frequency) {
+  const auto &b = record.bytes;
+  if (network == 0 || network == 0xffff || b[0] != 0x52 || b[1] != 0x4c || b[2] != 1 || b[3] != 1 ||
+      ((uint16_t(b[4]) << 8) | b[5]) != network ||
+      ((uint32_t(b[6]) << 24) | (uint32_t(b[7]) << 16) | (uint32_t(b[8]) << 8) | b[9]) != frequency ||
+      crc16(b.data(), 60) != ((uint16_t(b[60]) << 8) | b[61]))
+    return false;
+  std::array<bool, HOP_COUNT> seen{};
+  for (size_t i = 0; i < HOP_COUNT; ++i) {
+    if (b[10 + i] >= HOP_COUNT || seen[b[10 + i]])
+      return false;
+    seen[b[10 + i]] = true;
+  }
+  reset();
+  std::copy_n(b.begin() + 10, HOP_COUNT, active_.begin());
+  active_valid_ = true;
+  rebuilding_ = false;
+  return true;  // Still TX-ineligible until independent fresh clock traffic agrees.
+}
+
+bool HopLearner::save(HopMapRecord &record, uint16_t network, uint32_t frequency) const {
+  if (!ready() || network == 0 || network == 0xffff)
+    return false;
+  auto &b = record.bytes;
+  b[0] = 0x52;
+  b[1] = 0x4c;
+  b[2] = 1;  // Storage version.
+  b[3] = 1;  // Candidate/sync/timing profile version.
+  b[4] = network >> 8;
+  b[5] = network;
+  b[6] = frequency >> 24;
+  b[7] = frequency >> 16;
+  b[8] = frequency >> 8;
+  b[9] = frequency;
+  std::copy(active_.begin(), active_.end(), b.begin() + 10);
+  const uint16_t crc = crc16(b.data(), 60);
+  b[60] = crc >> 8;
+  b[61] = crc;
+  return true;
+}
 namespace {
 
 constexpr std::array<uint8_t, 31> THERMOSTAT_WRITE{0x1e, 0x81, 0xff, 0x00, 0x9a, 0x80, 0x80, 0x46, 0x4a, 0x2f, 0xff,
@@ -299,7 +421,8 @@ void ClockListenWindow::advance() {
   sync_us += static_cast<uint32_t>((uint64_t(ticks) * 1000000 + 2048) / 4096);
 }
 
-bool clock_slot(const Frame &frame, uint16_t network, uint8_t &slot, uint32_t &phase_ticks, ClockListenWindow &next) {
+bool clock_slot(const Frame &frame, uint16_t network, uint8_t &slot, uint32_t &phase_ticks, ClockListenWindow &next,
+                uint32_t *counter) {
   if (!valid_frame(frame) || (frame.data[1] != 0x02 && frame.data[1] != 0x06) ||
       read16(frame.data.data() + 2) != 0xffff || read16(frame.data.data() + 4) != network ||
       read16(frame.data.data() + 6) != network || frame.data[8] != 0 || frame.data[9] != 0 || frame.data[10] != 0xff)
@@ -337,6 +460,8 @@ bool clock_slot(const Frame &frame, uint16_t network, uint8_t &slot, uint32_t &p
   phase_ticks = (c1 - c3) & COUNTER_MASK;
   next = {slot, copy, 0};
   next.advance();
+  if (counter != nullptr)
+    *counter = c1;
   return true;
 }
 

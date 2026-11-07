@@ -12,7 +12,7 @@
 using namespace esphome;
 using namespace esphome::redlink;
 namespace {
-uint32_t now_us = 1000000;
+uint64_t now_us = 1000000;
 unsigned transport_sends = 0;
 }  // namespace
 namespace esphome {
@@ -30,8 +30,10 @@ bool RedLinkRadio::send_frame(const Frame &) {
 }
 bool RedLinkRadio::tx_finished() { return true; }
 void RedLinkRadio::begin_rx() {}
-bool RedLinkRadio::listen_slot_(uint8_t slot) {
-  receive_slot_ = slot;
+bool RedLinkRadio::listen_candidate_(uint8_t rank) {
+  if (rank >= HOP_COUNT)
+    return false;
+  receive_candidate_ = rank;
   return true;
 }
 }  // namespace redlink
@@ -119,11 +121,20 @@ class TestClimate : public RedLinkClimate {
   using RedLinkClimate::write_count_;
   using RedLinkClimate::have_clock_;
   using RedLinkClimate::paired_state_;
+  using RedLinkClimate::hop_;
+  using RedLinkClimate::schedule_;
+  using RedLinkClimate::listen_for_clock_;
+  using RedLinkClimate::receive_candidate_;
+  using RedLinkClimate::clock_listen_;
+  using RedLinkClimate::clock_received_ms_;
+  using RedLinkClimate::tx_allowed_;
+  using RedLinkClimate::fresh_clock_;
+  using RedLinkClimate::have_clock_counter_;
   binary_sensor::BinarySensor pending, verified, acknowledged, locked, emergency;
   text_sensor::TextSensor result;
   TestSystemModeSelect system_mode{this};
 
-  TestClimate() {
+  explicit TestClimate(bool seed_map = true) {
     // Match the captured test frames explicitly; production IDs have no defaults.
     set_network_id(0x389e);
     set_gateway_id(0xb14f);
@@ -137,10 +148,17 @@ class TestClimate : public RedLinkClimate {
     set_emergency_heat_sensor(&emergency);
     set_result_sensor(&result);
     setup();
+    // Explicit synthetic test permutation, never a production default.
+    if (seed_map) {
+      for (uint8_t slot = 0; slot < HOP_COUNT; ++slot) {
+        CHECK(hop_.observe(slot, 49 - slot, 1000 + slot));
+        CHECK(hop_.observe(slot, 49 - slot, 2000 + slot));
+      }
+    }
     receive_only_ = false;
     transmit_enabled_ = true;
     paired_state_ = true;
-    have_clock_ = clock_published_ = true;
+    have_clock_ = clock_published_ = have_clock_counter_ = seed_map;
     clock_received_ms_ = millis();
     clock_listen_.sync_us = micros() + 100000;
     locked.publish_state(true);
@@ -745,7 +763,214 @@ static void confirmed_hold_deadlines() {
   CHECK(heat.state == "Following schedule" && cool.state == "Permanent hold");
 }
 
+static void passive_discovery_and_dynamic_slot_zero() {
+  TestClimate climate;
+  // Reversed map sends logical slot zero on rank49/channel121, not channel10.
+  climate.clock_listen_.sync_us = micros() + 1000000;
+  climate.stage_ = TestClimate::Stage::BEFORE;
+  climate.schedule_();
+  CHECK(climate.exchange_ == TestClimate::Exchange::SLOT);
+  CHECK(climate.receive_candidate_ == 49);
+  CHECK(candidate_channel(climate.receive_candidate_).channel == 121);
+  CHECK(candidate_channel(climate.receive_candidate_).sync == 0x639c);
+  climate.finish_("test finished", false);
+  climate.rediscover_channels();
+  CHECK(!climate.tx_allowed_() && !climate.hop_.ready());
+  CHECK(climate.hop_.active_rank(0) == 49);  // Partial rebuild never replaces active map.
+  climate.request_control_(targets(72));
+  CHECK(climate.stage_ == TestClimate::Stage::IDLE && !climate.pending.state);
+  climate.refresh();
+  CHECK(climate.stage_ == TestClimate::Stage::IDLE);
+  // A different permutation must also drive TX tuning, not just the reverse fixture.
+  for (uint8_t slot = 0; slot < HOP_COUNT; ++slot) {
+    const uint8_t rank = (slot * 17 + 7) % HOP_COUNT;
+    CHECK(climate.hop_.observe(slot, rank, 10000 + slot));
+    CHECK(climate.hop_.observe(slot, rank, 20000 + slot));
+  }
+  climate.set_transmit_enabled(true);
+  climate.have_clock_ = true;
+  climate.clock_received_ms_ = millis();
+  climate.clock_listen_.sync_us = micros() + 1000000;
+  climate.stage_ = TestClimate::Stage::BEFORE;
+  climate.schedule_();
+  CHECK(climate.receive_candidate_ == 7 && climate.exchange_ == TestClimate::Exchange::SLOT);
+  CHECK(candidate_channel(climate.receive_candidate_).channel == 18);
+  climate.finish_("test finished", false);
+  climate.hop_.reset();
+  climate.have_clock_ = true;
+  climate.have_clock_counter_ = true;
+  climate.clock_listen_ = {12, 0, micros() + 100000};
+  climate.listen_for_clock_();
+  CHECK(climate.receive_candidate_ == 0);
+  climate.clock_listen_.sync_us += 15041992;
+  climate.listen_for_clock_();
+  CHECK(climate.receive_candidate_ == 1);  // Unknown-slot trial advances, not lockstep.
+}
+
+static Frame clock_frame(uint8_t slot, uint32_t c1, uint8_t copy = 0) {
+  Frame frame;
+  frame.size = 24;
+  const uint8_t header[] = {0x15, 0x02, 0xff, 0xff, 0x38, 0x9e, 0x38, 0x9e, 0, 0, 0xff, 0x8a, 0x51};
+  std::copy(std::begin(header), std::end(header), frame.data.begin());
+  const uint32_t c2 = (c1 - 18 - copy * 242) & 0xffffff;
+  const uint32_t counters[] = {c1, c2, (c2 - ((slot + 50 - copy) % 50) * 11) & 0xffffff};
+  for (uint8_t i = 0; i < 3; ++i) {
+    frame.data[13 + i * 3] = counters[i] >> 16;
+    frame.data[14 + i * 3] = counters[i] >> 8;
+    frame.data[15 + i * 3] = counters[i];
+  }
+  const uint16_t crc = crc16(frame.data.data(), frame.size - 2);
+  frame.data[22] = crc >> 8;
+  frame.data[23] = crc;
+  return frame;
+}
+
+static void cold_scanner_learns_unknown_order() {
+  now_us = 0;
+  TestClimate cold(false);
+  uint64_t burst = 0;
+  uint8_t copy = 0;
+  uint64_t due = 1000000;
+  // One receiver sees only its tuned channel. Drive actual scan decisions,
+  // rather than injecting each frame on the channel the learner needs.
+  for (; now_us < 4ULL * 3600 * 1000000 && !cold.hop_.ready(); now_us += 1000) {
+    cold.listen_for_clock_();
+    if (now_us < due)
+      continue;
+    const uint8_t slot = (burst + copy) % HOP_COUNT;
+    const uint8_t physical_rank = (slot * 17 + 7) % HOP_COUNT;
+    if (cold.receive_candidate_ == physical_rank) {
+      const uint32_t counter = (1000000 + burst * 61611 + copy * 242 + 18) & 0xffffff;
+      cold.received_(clock_frame(slot, counter, copy), static_cast<uint32_t>(due));
+    }
+    if (++copy == 4) {
+      copy = 0;
+      ++burst;
+    }
+    due = 1000000 + (burst * 61611 + copy * 242) * 1000000ULL / 4096;
+  }
+  CHECK(cold.hop_.ready() && cold.hop_.confirmed() == HOP_COUNT);
+  for (uint8_t slot = 0; slot < HOP_COUNT; ++slot)
+    CHECK(cold.hop_.active_rank(slot) == (slot * 17 + 7) % HOP_COUNT);
+}
+
+static void live_learning_cache_and_duplicates() {
+  ESPPreferences preferences;
+  preference_records.clear();
+  global_preferences = &preferences;
+  TestClimate cold(false);
+  cold.have_clock_ = false;
+  CHECK(!cold.hop_.ready() && !cold.tx_allowed_());
+  uint32_t counter = 1000;
+  for (uint8_t pass = 0; pass < 2; ++pass) {
+    for (uint8_t slot = 0; slot < HOP_COUNT; ++slot) {
+      cold.receive_candidate_ = (slot * 17 + 7) % HOP_COUNT;
+      const Frame frame = clock_frame(slot, counter);
+      cold.received_(frame, micros());
+      cold.received_(frame, micros());  // Duplicate FIFO/readback never adds evidence.
+      counter += 61611;
+      now_us += 15041992;  // 61611 ticks: preserve the measured counter/RF-time relationship.
+    }
+    CHECK(cold.hop_.confirmed() == (pass == 0 ? 0 : HOP_COUNT));
+    CHECK(preference_records.size() == (pass == 0 ? 0 : 1));
+  }
+  CHECK(cold.hop_.ready() && cold.tx_allowed_());
+  const auto saved = preference_records;
+  TestClimate restored(false);
+  CHECK(restored.hop_.cached() && !restored.hop_.ready());
+  restored.receive_candidate_ = 7;
+  restored.received_(clock_frame(0, counter), micros());
+  restored.received_(clock_frame(0, counter), micros());
+  CHECK(!restored.hop_.ready());
+  restored.receive_candidate_ = 24;
+  now_us += 59082;
+  restored.received_(clock_frame(1, counter + 242), micros());
+  CHECK(restored.hop_.ready());
+  const uint32_t fresh_ms = restored.clock_received_ms_;
+  now_us += 19000000;
+  restored.received_(clock_frame(1, counter + 242), micros());
+  CHECK(restored.clock_received_ms_ == fresh_ms);  // Replay cannot refresh TX clock.
+  restored.stage_ = TestClimate::Stage::BEFORE;
+  restored.schedule_();
+  CHECK(restored.exchange_ == TestClimate::Exchange::CLOCK);
+  restored.finish_("test complete", false);
+  restored.rediscover_channels();
+  restored.receive_candidate_ = 2;
+  restored.received_(clock_frame(0, counter + 61611), micros());
+  CHECK(preference_records == saved && !restored.hop_.ready());
+  restored.receive_candidate_ = 3;
+  now_us += 15041992;
+  restored.received_(clock_frame(0, counter + 123222), micros());
+  CHECK(restored.hop_.conflicted() && !restored.tx_allowed_());
+  CHECK(preference_records == saved);  // Conflict cannot overwrite the last good map.
+  preference_records.begin()->second[12] ^= 1;
+  TestClimate corrupt(false);
+  CHECK(!corrupt.hop_.cached() && !corrupt.hop_.ready());
+  global_preferences = nullptr;
+  preference_records.clear();
+}
+
+static void clock_epoch_reacquisition() {
+  now_us = 1000000;
+  TestClimate climate;
+  climate.have_clock_ = climate.have_clock_counter_ = false;
+  uint32_t counter = 4000000;
+  climate.receive_candidate_ = 49;
+  climate.received_(clock_frame(0, counter), micros());
+  CHECK(!climate.fresh_clock_());
+  now_us += 59082;
+  counter += 242;
+  climate.receive_candidate_ = 48;
+  climate.received_(clock_frame(1, counter), micros());
+  CHECK(climate.fresh_clock_() && climate.hop_.ready());
+
+  // More than the half-counter period: a distinct timed pair must recover
+  // without waiting for a 4096-second counter wrap or discarding the full map.
+  now_us += 2100000000U;
+  counter = (counter + 2100U * 4096) & 0xffffff;
+  climate.receive_candidate_ = 47;
+  climate.received_(clock_frame(2, counter), micros());
+  CHECK(!climate.fresh_clock_() && climate.hop_.active_rank(0) == 49);
+  climate.received_(clock_frame(2, counter), micros());
+  CHECK(!climate.fresh_clock_());
+  now_us += 59082;
+  counter = (counter + 242) & 0xffffff;
+  climate.receive_candidate_ = 46;
+  climate.received_(clock_frame(3, counter), micros());
+  CHECK(climate.fresh_clock_() && climate.hop_.ready() && !climate.hop_.conflicted());
+
+  // EIM reset: lower counters alone are not fresh; reject duplicate and
+  // incorrectly timed copies before accepting a new, consistent pair.
+  now_us += 15041992;
+  climate.receive_candidate_ = 49;
+  climate.received_(clock_frame(0, 1000), micros());
+  CHECK(!climate.fresh_clock_());
+  climate.received_(clock_frame(0, 1000), micros());
+  CHECK(!climate.fresh_clock_());
+  now_us += 500000;
+  climate.receive_candidate_ = 48;
+  climate.received_(clock_frame(1, 1242), micros());
+  CHECK(!climate.fresh_clock_());
+  now_us += 59082;
+  climate.receive_candidate_ = 47;
+  climate.received_(clock_frame(2, 1484), micros());
+  CHECK(climate.fresh_clock_() && climate.hop_.ready() && !climate.hop_.conflicted());
+
+  TestClimate conflict(false);
+  conflict.receive_candidate_ = 1;
+  conflict.received_(clock_frame(0, 1000), micros());
+  now_us += 59082;
+  conflict.receive_candidate_ = 2;
+  conflict.received_(clock_frame(1, 1000), micros());
+  CHECK(conflict.hop_.conflicted() && !conflict.fresh_clock_());
+  CHECK(conflict.hop_.known() == 1 && conflict.hop_.confirmed() == 0);
+}
+
 int main() {
+  cold_scanner_learns_unknown_order();
+  clock_epoch_reacquisition();
+  live_learning_cache_and_duplicates();
+  passive_discovery_and_dynamic_slot_zero();
   confirmed_hold_deadlines();
   measured_climate_traits_and_initial_unknown();
   measurements_are_independently_guarded();

@@ -59,7 +59,7 @@ climate:
       number: GPIO47
       allow_other_uses: true
     # REQUIRED configuration: these arbitrary examples must be replaced.
-    # Changing IDs alone does not adapt the shipped 0x389e-specific hop map.
+    # Hop order is discovered passively for this network; this is not enrollment.
     network_id: 0x1234
     gateway_id: 0x5678
     # Experimental hardware defaults, NOT universal/calibrated values.
@@ -77,6 +77,8 @@ climate:
       name: RedLINK Transaction
     pairing_status:
       name: RedLINK Pairing Status
+    discovery_status:
+      name: RedLINK Discovery Status
     paired:
       name: RedLINK Paired
     acknowledged:
@@ -102,6 +104,12 @@ switch:
       - lambda: id(redlink_thermostat).set_transmit_enabled(false);
 
 button:
+  - platform: template
+    name: RedLINK Rediscover Channels
+    entity_category: config
+    on_press:
+      - lambda: id(redlink_thermostat).rediscover_channels();
+
   - platform: template
     name: RedLINK Pair Gateway
     entity_category: config

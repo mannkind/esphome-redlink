@@ -66,14 +66,49 @@ struct HopChannel {
   uint8_t channel;
   uint16_t sync;
 };
-// Installation 389e: measured receive map. Transmissions still use slot zero only.
-extern const std::array<HopChannel, 50> HOP_CHANNELS;
+// Physical candidates in frequency order, NOT an installation's logical hop order.
+constexpr size_t HOP_COUNT = 50;
+constexpr uint8_t UNKNOWN_CHANNEL = 0xff;
+extern const std::array<uint8_t, HOP_COUNT> CANDIDATE_CHANNELS;
+HopChannel candidate_channel(uint8_t rank);
+
+// Fixed byte layout: magic/version/profile, network, tuning reference, slot ranks, CRC.
+struct HopMapRecord {
+  std::array<uint8_t, 62> bytes{};
+};
+
+class HopLearner {
+ public:
+  HopLearner() { reset(); }
+  void reset(bool retain_active = false);
+  void restart_clock_epoch();
+  void reject_conflict() { conflict_ = true; }
+  bool observe(uint8_t slot, uint8_t rank, uint32_t counter, uint32_t observed_ms = 0);
+  bool ready() const { return active_valid_ && !rebuilding_ && !conflict_ && fresh_count_ >= 2; }
+  bool conflicted() const { return conflict_; }
+  bool cached() const { return active_valid_ && !rebuilding_; }
+  uint8_t known() const;
+  uint8_t confirmed() const;
+  uint8_t rank(uint8_t slot) const;
+  uint8_t active_rank(uint8_t slot) const { return active_[slot]; }
+  bool load(const HopMapRecord &record, uint16_t network, uint32_t frequency);
+  bool save(HopMapRecord &record, uint16_t network, uint32_t frequency) const;
+
+ protected:
+  std::array<uint8_t, HOP_COUNT> pending_{}, observations_{}, active_{};
+  std::array<uint32_t, HOP_COUNT> counters_{};
+  std::array<uint32_t, HOP_COUNT> observed_ms_{};
+  bool active_valid_{false}, rebuilding_{true}, conflict_{false};
+  uint8_t fresh_count_{0};
+  uint32_t fresh_counter_{0};
+};
 struct ClockListenWindow {
   uint8_t slot{0}, copy{0};
   uint32_t sync_us{0};
   void advance();
 };
-bool clock_slot(const Frame &frame, uint16_t network, uint8_t &slot, uint32_t &phase_ticks, ClockListenWindow &next);
+bool clock_slot(const Frame &frame, uint16_t network, uint8_t &slot, uint32_t &phase_ticks, ClockListenWindow &next,
+                uint32_t *counter = nullptr);
 
 // One explicitly requested enrollment. Transport and the slot clock remain the caller's responsibility.
 // Registration and completion need exact readback; a commit ACK only advances to registry verification.

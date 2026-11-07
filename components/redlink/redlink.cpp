@@ -56,6 +56,11 @@ void RedLinkSystemModeSelect::publish_mode(uint8_t mode) {
 }
 
 void RedLinkClimate::setup() {
+  if (network_ == 0 || network_ == 0xffff) {
+    this->mark_failed();
+    report_("Invalid configured network ID; discovery and TX disabled");
+    return;
+  }
   RedLinkRadio::setup();
   this->set_supported_custom_fan_modes({"circulate"});
   this->set_supported_custom_presets({"schedule", "temporary", "permanent", "mixed"});
@@ -68,11 +73,17 @@ void RedLinkClimate::setup() {
     paired_state_ = pairing_preference_.load(&marker) && marker.magic == PAIRING_MAGIC && marker.network == network_ &&
                     marker.gateway == gateway_;
     pairing_saved_ = paired_state_;
+    hop_preference_ =
+        global_preferences->make_preference<HopMapRecord>(0x524d0101 ^ (uint32_t(network_) << 16) ^ frequency_);
+    HopMapRecord record{};
+    if (hop_preference_.load(&record) && hop_.load(record, network_, frequency_))
+      map_saved_ = true;
   }
   if (paired_ != nullptr)
     paired_->publish_state(paired_state_);
   report_pairing_(paired_state_ ? "Previously verified; not checked this boot"
                                 : "Not verified; Refresh Status checks the existing association");
+  report_discovery_();
   high_frequency_.start();
   report_("Transmit disabled; passive clock acquisition");
   if (acknowledged_ != nullptr)
@@ -91,7 +102,7 @@ void RedLinkClimate::dump_config() {
   LOG_SELECT("", "System Mode", system_mode_);
   ESP_LOGCONFIG(TAG, "  Network: %04x, configured gateway identity: %04x", network_, gateway_);
   ESP_LOGCONFIG(TAG, "  TX advance: %ld us; slot 0 only; experimental RF timing", (long) tx_advance_us_);
-  ESP_LOGCONFIG(TAG, "  RX: search spaced channels, then follow all 50 clock slots; 18 s clock freshness");
+  ESP_LOGCONFIG(TAG, "  RX: passive 50-candidate discovery; two independent observations/slot; 18 s clock freshness");
 }
 
 climate::ClimateTraits RedLinkClimate::traits() {
@@ -126,7 +137,9 @@ bool RedLinkClimate::save_pairing_(bool verified) {
   return global_preferences != nullptr && pairing_preference_.save(&marker) && global_preferences->sync();
 }
 
-bool RedLinkClimate::tx_allowed_() const { return !this->is_failed() && transmit_enabled_ && !receive_only_; }
+bool RedLinkClimate::tx_allowed_() const {
+  return !this->is_failed() && transmit_enabled_ && !receive_only_ && hop_.ready();
+}
 
 void RedLinkClimate::report_pairing_stage_() {
   switch (enrollment_.state()) {
@@ -152,7 +165,7 @@ void RedLinkClimate::report_pairing_stage_() {
 
 void RedLinkClimate::pair_gateway() {
   if (!tx_allowed_()) {
-    report_("Pairing rejected: radio unavailable, receive-only, or transmit disabled");
+    report_("Pairing rejected: discovery not ready, radio unavailable, receive-only, or transmit disabled");
     return;
   }
   if (stage_ != Stage::IDLE || exchange_ == Exchange::TX) {
@@ -176,28 +189,138 @@ bool RedLinkClimate::fresh_clock_() const {
   return have_clock_ && millis() - clock_received_ms_ < 18000;
 }
 
+bool RedLinkClimate::track_clock_(uint8_t slot, uint32_t counter, uint32_t phase, ClockListenWindow next,
+                                  uint32_t sync_us) {
+  const uint32_t now = millis();
+  const uint32_t age_ms = now - clock_received_ms_;
+  const uint32_t delta = (counter - last_clock_counter_) & 0xffffff;
+  if (have_clock_counter_ && delta == 0) {
+    if (age_ms < 20000 && (slot != clock_slot_ || receive_candidate_ != clock_candidate_))
+      hop_.reject_conflict();
+    return false;  // Duplicate never refreshes even a provisional anchor.
+  }
+  const uint32_t elapsed_us = sync_us - clock_sync_us_;
+  const uint32_t counter_us = static_cast<uint32_t>((uint64_t(delta) * 1000000 + 2048) / 4096);
+  const bool consistent = have_clock_counter_ && age_ms < 20000 && delta < 0x800000 &&
+                          std::abs(int64_t(counter_us) - elapsed_us) <= 8000 + elapsed_us / 1000;
+  const bool need_anchor = !have_clock_counter_ || !consistent || (have_clock_ && !fresh_clock_());
+  if (need_anchor) {
+    if (have_clock_counter_) {
+      const uint32_t expected_ticks = static_cast<uint32_t>((uint64_t(age_ms) * 4096 + 500) / 1000) & 0xffffff;
+      int32_t error = (delta - expected_ticks) & 0xffffff;
+      if (error >= 0x800000)
+        error -= 0x1000000;
+      clock_epoch_pending_ |= age_ms >= 2048000 || uint32_t(std::abs(error)) > 262 + age_ms / 244;
+    }
+    have_clock_ = false;
+    // Cold discovery may collect one tentative map observation without clock lock.
+    // Cache/epoch revalidation must wait for a temporally consistent pair.
+    if (!hop_.cached() && !clock_epoch_pending_)
+      hop_.observe(slot, receive_candidate_, counter, now);
+  } else {
+    if (clock_epoch_pending_)
+      hop_.restart_clock_epoch();
+    // Cache and epoch observations are committed only after a second counter
+    // agrees with elapsed RF sync time. A replay alone never establishes freshness.
+    if (!have_clock_)
+      hop_.observe(clock_slot_, clock_candidate_, last_clock_counter_, clock_received_ms_);
+    if (!hop_.observe(slot, receive_candidate_, counter, now))
+      return false;
+    have_clock_ = true;
+    if (clock_epoch_pending_)
+      ESP_LOGI(TAG, "Clock epoch reacquired; retaining confirmed hop map");
+    clock_epoch_pending_ = false;
+  }
+  last_clock_counter_ = counter;
+  clock_slot_ = slot;
+  clock_candidate_ = receive_candidate_;
+  have_clock_counter_ = true;
+  clock_sync_us_ = sync_us;
+  clock_phase_ticks_ = phase;
+  clock_received_ms_ = now;
+  clock_listen_ = next;
+  clock_listen_.sync_us += sync_us;
+  if (!have_clock_)
+    ESP_LOGI(TAG, "Clock provisional: slot %u; awaiting a second timed counter", slot);
+  return have_clock_;
+}
+
+bool RedLinkClimate::listen_slot_(uint8_t slot) { return listen_candidate_(hop_.rank(slot)); }
+
+void RedLinkClimate::report_discovery_() {
+  char message[96];
+  const char *state = hop_.conflicted() ? "conflict; rediscovery required"
+                      : hop_.ready()    ? (map_saved_ ? "ready; saved" : "ready; NOT saved")
+                      : hop_.cached()   ? "cache awaiting fresh clocks"
+                                        : "learning; TX blocked";
+  std::snprintf(message, sizeof(message), "%s: %u/50 seen, %u/50 confirmed", state, hop_.known(), hop_.confirmed());
+  ESP_LOGI(TAG, "Discovery: %s", message);
+  if (discovery_status_ != nullptr)
+    discovery_status_->publish_state(message);
+}
+
+void RedLinkClimate::rediscover_channels() {
+  if (exchange_ == Exchange::TX) {
+    report_("Rediscovery rejected: packet on air; retry when idle");
+    return;
+  }
+  if (stage_ != Stage::IDLE || have_queued_control_)
+    finish_("Passive rediscovery requested; outstanding command cancelled", false);
+  transmit_enabled_ = false;
+  // Keep the last complete map in RAM/flash until a complete replacement exists.
+  hop_.reset(true);
+  have_clock_ = have_clock_counter_ = false;
+  clock_epoch_pending_ = false;
+  map_saved_ = false;
+  scan_trials_.fill(0);
+  scan_changed_ms_ = millis();
+  scan_round_ = scan_window_us_ = 0;
+  listen_candidate_(0);
+  report_("Transmit disabled; passive rediscovery started; re-enable explicitly after completion");
+  report_discovery_();
+}
+
+uint8_t RedLinkClimate::scan_candidate_(uint8_t start) const {
+  std::array<bool, HOP_COUNT> assigned{};
+  for (uint8_t slot = 0; slot < HOP_COUNT; ++slot) {
+    const uint8_t rank = hop_.rank(slot);
+    if (rank < HOP_COUNT)
+      assigned[rank] = true;
+  }
+  for (uint8_t offset = 0; offset < HOP_COUNT; ++offset) {
+    const uint8_t rank = (start + offset) % HOP_COUNT;
+    if (!assigned[rank])
+      return rank;
+  }
+  return start;  // All assigned: continue collecting independent repeats.
+}
+
 void RedLinkClimate::listen_for_clock_() {
-  // Never cut off an in-progress frame to move to another receive channel.
-  if (receiving_())
+  if (receiving_() || hop_.conflicted())
     return;
   const uint32_t now = millis();
-  if (have_clock_ && now - clock_received_ms_ < 20000) {
-    // Advance past missed copies instead of waiting on a channel whose packet
-    // has already passed. Eight ms covers drift without eating the 59-ms gap.
+  if (have_clock_counter_ && now - clock_received_ms_ < 20000) {
     const uint32_t now_us = micros();
-    while (static_cast<int32_t>(now_us - clock_listen_.sync_us) > 8000) {
+    while (static_cast<int32_t>(now_us - clock_listen_.sync_us) > 8000)
       clock_listen_.advance();
-      ESP_LOGI(TAG, "Clock copy missed; following slot %u, copy %u", clock_listen_.slot, clock_listen_.copy);
+    const uint8_t rank = hop_.rank(clock_listen_.slot);
+    if (rank != UNKNOWN_CHANNEL) {
+      listen_candidate_(rank);
+    } else if (scan_window_us_ != clock_listen_.sync_us) {
+      const uint8_t candidate = scan_candidate_(scan_trials_[clock_listen_.slot]);
+      scan_trials_[clock_listen_.slot] = (candidate + 1) % HOP_COUNT;
+      listen_candidate_(candidate);
     }
-    listen_slot_(clock_listen_.slot);
+    scan_window_us_ = clock_listen_.sync_us;
     scan_changed_ms_ = now;
     return;
   }
-  if (now - scan_changed_ms_ < 15400)
+  // Visit every unassigned candidate in order. Larger strides can form a closed
+  // subset once assigned channels are skipped. Vary dwell to avoid phase lock.
+  if (now - scan_changed_ms_ < 15400 + (scan_round_ % 13) * 137)
     return;
-  // Cover a complete 61611-tick broadcast period plus its four copies.
-  // Step five slots so search does not follow the EIM's own one-slot progression.
-  listen_slot_((receive_slot_ + 5) % HOP_CHANNELS.size());
+  ++scan_round_;
+  listen_candidate_(scan_candidate_((receive_candidate_ + 1) % HOP_COUNT));
   scan_changed_ms_ = now;
 }
 
@@ -225,7 +348,7 @@ void RedLinkClimate::on_radio_failure_() {
 
 bool RedLinkClimate::start_(const Control &control) {
   if (!tx_allowed_()) {
-    report_("Request rejected: radio unavailable, receive-only, or transmit disabled");
+    report_("Request rejected: discovery not ready, radio unavailable, receive-only, or transmit disabled");
     return false;
   }
   if (!valid_control(control)) {
@@ -286,7 +409,7 @@ void RedLinkClimate::request_control_(const Control &control) {
     return;
   }
   if (!tx_allowed_()) {
-    report_("Request rejected: radio unavailable, receive-only, or transmit disabled");
+    report_("Request rejected: discovery not ready, radio unavailable, receive-only, or transmit disabled");
     return;
   }
   if (!valid_requested_targets_(control)) {
@@ -497,18 +620,32 @@ void RedLinkClimate::schedule_() {
 
 void RedLinkClimate::received_(const Frame &frame, uint32_t sync_us) {
   ESP_LOGI(TAG, "RX CRC-valid: %u bytes, type 0x%02x, channel %u", unsigned(frame.size), frame.data[1],
-           HOP_CHANNELS[receive_slot_].channel);
+           candidate_channel(receive_candidate_).channel);
   uint8_t slot;
-  uint32_t phase;
+  uint32_t phase, counter;
   ClockListenWindow next;
-  if (clock_slot(frame, network_, slot, phase, next) && slot == receive_slot_) {
-    clock_sync_us_ = sync_us;
-    clock_phase_ticks_ = phase;
-    clock_received_ms_ = millis();
-    have_clock_ = true;
-    clock_listen_ = next;
-    clock_listen_.sync_us += sync_us;
-    ESP_LOGI(TAG, "EIM clock acquired: slot %u, phase %u ticks; following slot %u", slot, unsigned(phase), next.slot);
+  if (clock_slot(frame, network_, slot, phase, next, &counter)) {
+    const bool was_ready = hop_.ready();
+    const uint8_t before_known = hop_.known(), before_confirmed = hop_.confirmed();
+    const bool accepted = track_clock_(slot, counter, phase, next, sync_us);
+    if (hop_.conflicted()) {
+      have_clock_ = false;
+      if (stage_ != Stage::IDLE)
+        finish_("Discovery conflict; no further packets sent", false);
+      report_discovery_();
+      return;
+    }
+    if (accepted) {
+      ESP_LOGI(TAG, "EIM clock acquired: slot %u, channel %u, counter %lu; following slot %u", slot,
+               candidate_channel(receive_candidate_).channel, (unsigned long) counter, next.slot);
+    }
+    if (!was_ready && hop_.ready() && !map_saved_) {
+      HopMapRecord record{};
+      map_saved_ = global_preferences != nullptr && hop_.save(record, network_, frequency_) &&
+                   hop_preference_.save(&record) && global_preferences->sync();
+    }
+    if (before_known != hop_.known() || before_confirmed != hop_.confirmed() || was_ready != hop_.ready())
+      report_discovery_();
   }
   // Replies belong only to this receive window, never to another query/attempt.
   if (stage_ == Stage::IDLE || exchange_ != Exchange::RX)

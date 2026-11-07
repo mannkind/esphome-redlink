@@ -17,6 +17,10 @@ static uint32_t started;
 static std::vector<Sample> samples;
 static std::vector<uint32_t> read_starts;
 static Sample fallback;
+static bool emulate_registers = false, fifo_write = false;
+static uint8_t registers[64]{};
+static uint8_t marcstate = 1;
+static unsigned tx_strobes = 0;
 
 static void advance(uint32_t duration) {
   now += duration;
@@ -30,12 +34,43 @@ static void reset(uint32_t start, std::initializer_list<Sample> script = {}, Sam
   fallback = rest;
 }
 void transfer_status(uint8_t *data, size_t size) {
+  if (emulate_registers) {
+    CHECK(size == 2);
+    const uint8_t address = data[0] & 0x3f;
+    data[1] = address == 0x35 ? marcstate : address == 0x30 ? 0 : address == 0x31 ? 0x14 : registers[address];
+    return;
+  }
   CHECK(size == 2 && data[0] == 0xf5 && data[1] == 0);  // Burst-read MARCSTATE only.
   const size_t index = read_starts.size();
   read_starts.push_back(now);
   const Sample sample = index < samples.size() ? samples[index] : fallback;
   advance(sample.duration_us);
   data[1] = sample.value;
+}
+uint8_t transfer_command(uint8_t command) {
+  CHECK(emulate_registers);
+  if (command == 0x36)
+    marcstate = 1;
+  if (command == 0x34)
+    marcstate = 0x0d;
+  if (command == 0x3b)
+    registers[0x3a] = 0;
+  if (command == 0x35) {
+    marcstate = 0x13;
+    ++tx_strobes;
+  }
+  fifo_write = command == 0x7f || command == 0x3f;
+  return 0;
+}
+void write_bytes(const uint8_t *data, size_t size) {
+  CHECK(emulate_registers);
+  if (fifo_write) {
+    registers[0x3a] = size;
+    fifo_write = false;
+    return;
+  }
+  CHECK(size == 2 && data[0] < 64);
+  registers[data[0]] = data[1];
 }
 }  // namespace redlink_test
 
@@ -52,6 +87,19 @@ class TestRadio : public esphome::redlink::RedLinkRadio {
     health.publish_state(true);
   }
   using RedLinkRadio::wait_state_;
+  using RedLinkRadio::listen_candidate_;
+  using RedLinkRadio::hop_;
+  using RedLinkRadio::receive_candidate_;
+  void configure_bus() {
+    parent_ = this;
+    cs_ = &cs;
+    set_gdo0_pin(&gdo);
+  }
+  void enable_tx() {
+    receive_only_ = false;
+    transmit_enabled_ = true;
+  }
+  esphome::InternalGPIOPin cs, gdo;
   esphome::InternalGPIOPin miso;
   esphome::binary_sensor::BinarySensor health;
   bool fault_notified{false};
@@ -133,6 +181,38 @@ static void io_failure() {
   CHECK(read_starts.empty() && now == 2000);
 }
 
+static void learned_channel_registers_and_tx_guard() {
+  using namespace redlink_test;
+  using namespace esphome::redlink;
+  reset(0);
+  emulate_registers = true;
+  TestRadio radio;
+  radio.configure_bus();
+  radio.setup();
+  CHECK(!radio.is_failed());
+  const auto check_tuning = [](uint8_t rank) {
+    const HopChannel channel = candidate_channel(rank);
+    const uint32_t frequency = 904195310 + (int32_t(channel.channel) - 10) * 199951;
+    const uint32_t word = (uint64_t(frequency) * 65536 + 13000000) / 26000000;
+    CHECK(registers[0x04] == (channel.sync >> 8) && registers[0x05] == (channel.sync & 0xff));
+    CHECK(registers[0x0d] == (word >> 16) && registers[0x0e] == ((word >> 8) & 0xff) &&
+          registers[0x0f] == (word & 0xff));
+  };
+  CHECK(radio.receive_candidate_ == 0);
+  check_tuning(0);  // Initial RX is candidate channel4/sync636b, not hardcoded slot0/channel10.
+  radio.enable_tx();
+  CHECK(!radio.send_frame(status_query(0x389e, 0xb14f)) && tx_strobes == 0);
+  for (uint8_t slot = 0; slot < HOP_COUNT; ++slot) {
+    CHECK(radio.hop_.observe(slot, 49 - slot, 1000 + slot));
+    CHECK(radio.hop_.observe(slot, 49 - slot, 2000 + slot));
+  }
+  CHECK(!radio.send_frame(status_query(0x389e, 0xb14f)));  // Wrong physical candidate.
+  CHECK(radio.listen_candidate_(49));
+  check_tuning(49);
+  CHECK(radio.send_frame(status_query(0x389e, 0xb14f)) && tx_strobes == 1);
+  emulate_registers = false;
+}
+
 int main() {
   stale_read_crosses_deadline(0);
   stale_read_crosses_deadline(UINT32_MAX - 1500);
@@ -140,5 +220,6 @@ int main() {
   stuck_rx_is_bounded(UINT32_MAX - 1500);
   unstable_status();
   io_failure();
+  learned_channel_registers_and_tx_guard();
   std::puts("RedLINK radio wait-state tests passed");
 }

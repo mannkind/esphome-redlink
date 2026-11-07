@@ -5,6 +5,83 @@
 #include <cstring>
 using namespace esphome::redlink;
 
+// Historical installation map is a fixture only; production learns its own permutation.
+static constexpr std::array<uint8_t, 50> CAPTURE_CHANNELS{
+    10, 70,  50, 111, 26, 87, 58, 119, 89, 28, 91, 30, 77,  16, 14, 75, 66, 6,  109, 48, 73, 12, 113, 52, 62,
+    4,  117, 56, 115, 54, 32, 93, 83,  22, 97, 44, 60, 121, 99, 46, 34, 95, 18, 79,  81, 20, 24, 85,  8,  68};
+
+static void discovery_and_persistence() {
+  HopLearner learner;
+  HopMapRecord record{};
+  CHECK(!learner.ready() && !learner.save(record, 0x389e, 904195310));
+  CHECK(learner.observe(0, 49, 0xfffff0));
+  CHECK(!learner.observe(0, 49, 0xfffff0));  // Duplicate cannot confirm.
+  CHECK(!learner.observe(0, 49, 0xffffe0));  // Old replay cannot confirm.
+  CHECK(learner.confirmed() == 0);
+  CHECK(learner.observe(0, 49, 0x10));  // Forward counter wrap.
+  CHECK(learner.confirmed() == 1);
+  for (uint8_t slot = 1; slot < HOP_COUNT; ++slot) {
+    CHECK(learner.observe(slot, 49 - slot, 1000 + slot));
+    CHECK(learner.observe(slot, 49 - slot, 2000 + slot));
+  }
+  CHECK(learner.ready() && learner.active_rank(0) == 49);
+  CHECK(learner.save(record, 0x389e, 904195310));
+  HopLearner loaded;
+  CHECK(!loaded.load(record, 0x31fd, 904195310));
+  CHECK(!loaded.load(record, 0x389e, 904195311));
+  CHECK(loaded.load(record, 0x389e, 904195310));
+  CHECK(loaded.cached() && !loaded.ready());
+  CHECK(loaded.observe(4, 45, 3000));
+  CHECK(!loaded.observe(4, 45, 3000));
+  CHECK(!loaded.ready());
+  CHECK(loaded.observe(5, 44, 3242) && loaded.ready());
+  HopMapRecord corrupt = record;
+  corrupt.bytes[12] ^= 1;
+  HopLearner rejected;
+  CHECK(!rejected.load(corrupt, 0x389e, 904195310) && !rejected.ready());
+  corrupt = record;
+  corrupt.bytes[11] = corrupt.bytes[10];  // Invalid permutation even with a correct CRC.
+  const uint16_t checksum = crc16(corrupt.bytes.data(), 60);
+  corrupt.bytes[60] = checksum >> 8;
+  corrupt.bytes[61] = checksum;
+  CHECK(!rejected.load(corrupt, 0x389e, 904195310));
+  learner.reset(true);
+  CHECK(learner.active_rank(0) == 49 && !learner.ready());
+  CHECK(learner.observe(0, 1, 4000));
+  HopMapRecord preserved = record;
+  CHECK(!learner.save(preserved, 0x389e, 904195310) && preserved.bytes == record.bytes);
+  CHECK(!learner.observe(1, 1, 4242) && learner.conflicted());  // Duplicate physical assignment.
+  learner.reset();
+  CHECK(learner.observe(0, 1, 5000));
+  CHECK(!learner.observe(0, 2, 5242) && learner.conflicted());  // Conflicting slot.
+  CHECK(!loaded.observe(5, 43, 6000) && loaded.conflicted() && !loaded.ready());
+  HopLearner counter_conflict;
+  CHECK(counter_conflict.observe(0, 0, 1000));
+  CHECK(!counter_conflict.observe(1, 1, 1000) && counter_conflict.conflicted());
+  CHECK(counter_conflict.known() == 1 && counter_conflict.confirmed() == 0);
+  HopLearner epoch;
+  CHECK(epoch.observe(0, 0, 1000));
+  epoch.restart_clock_epoch();
+  CHECK(epoch.observe(0, 0, 1000) && epoch.confirmed() == 0);
+  CHECK(!epoch.observe(0, 0, 1000) && epoch.confirmed() == 0);
+  CHECK(epoch.observe(0, 0, 1242) && epoch.confirmed() == 1);
+  epoch.reset();
+  CHECK(epoch.observe(0, 0, 1000, 1000));
+  CHECK(epoch.observe(0, 0, 1000, 2101000) && epoch.confirmed() == 0);
+  CHECK(!epoch.observe(0, 0, 1000, 2101001) && epoch.confirmed() == 0);
+  CHECK(epoch.observe(0, 0, 1242, 2101059) && epoch.confirmed() == 1);
+  HopLearner retained;
+  CHECK(retained.load(record, 0x389e, 904195310));
+  CHECK(retained.observe(0, 49, 1000));
+  CHECK(retained.observe(1, 48, 1242) && retained.ready());
+  retained.restart_clock_epoch();
+  CHECK(!retained.ready() && retained.active_rank(0) == 49);
+  CHECK(retained.observe(0, 49, 100) && !retained.ready());
+  CHECK(retained.observe(1, 48, 342) && retained.ready());
+  for (uint8_t rank = 0; rank < HOP_COUNT; ++rank)
+    CHECK(candidate_channel(rank).sync == 0x636b + rank);
+}
+
 static Frame from_hex(const char *hex) {
   Frame f;
   const size_t length = std::strlen(hex);
@@ -363,6 +440,7 @@ static void emergency_heat_tests() {
 }
 
 int main() {
+  discovery_and_persistence();
   enrollment_tests();
   fresh_identity_tests();
   emergency_heat_tests();
@@ -561,8 +639,8 @@ int main() {
   };
   for (const auto &capture : captures) {
     CHECK(clock_slot(from_hex(capture.hex), 0x389e, slot, phase, next));
-    CHECK(HOP_CHANNELS[slot].channel == capture.channel);
-    CHECK(HOP_CHANNELS[next.slot].channel == capture.next_channel);
+    CHECK(CAPTURE_CHANNELS[slot] == capture.channel);
+    CHECK(CAPTURE_CHANNELS[next.slot] == capture.next_channel);
   }
   // Missing copies must advance reception, not strand it on an old frequency.
   // Include slot 49 -> 0, the final-copy -> next-burst transition, and micros wrap.

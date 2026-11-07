@@ -28,6 +28,8 @@ class RedLinkClimate : public RedLinkRadio, public climate::Climate {
   void set_emergency_heat_sensor(binary_sensor::BinarySensor *value) { emergency_heat_ = value; }
   void set_system_mode_select(RedLinkSystemModeSelect *value) { system_mode_ = value; }
   void set_pairing_status_sensor(text_sensor::TextSensor *value) { pairing_status_ = value; }
+  void set_discovery_status_sensor(text_sensor::TextSensor *value) { discovery_status_ = value; }
+  void rediscover_channels();
   void set_heat_hold_until_sensor(text_sensor::TextSensor *value) { heat_hold_until_ = value; }
   void set_cool_hold_until_sensor(text_sensor::TextSensor *value) { cool_hold_until_ = value; }
   void set_paired_sensor(binary_sensor::BinarySensor *value) { paired_ = value; }
@@ -57,6 +59,10 @@ class RedLinkClimate : public RedLinkRadio, public climate::Climate {
   void report_(const char *message);
   bool fresh_clock_() const;
   void listen_for_clock_();
+  bool track_clock_(uint8_t slot, uint32_t counter, uint32_t phase, ClockListenWindow next, uint32_t sync_us);
+  void report_discovery_();
+  bool listen_slot_(uint8_t slot);
+  uint8_t scan_candidate_(uint8_t start) const;
   void report_pairing_(const char *message);
   void report_pairing_stage_();
   bool save_pairing_(bool verified);
@@ -75,7 +81,13 @@ class RedLinkClimate : public RedLinkRadio, public climate::Climate {
   bool complete_association_{false};
   uint8_t attempts_{0};
   uint32_t clock_sync_us_{0}, clock_phase_ticks_{0}, clock_received_ms_{0};
-  uint32_t scan_changed_ms_{0};
+  uint32_t scan_changed_ms_{0}, scan_round_{0}, scan_window_us_{0};
+  std::array<uint8_t, HOP_COUNT> scan_trials_{};
+  uint32_t last_clock_counter_{0};
+  bool have_clock_counter_{false}, map_saved_{false};
+  uint8_t clock_slot_{0}, clock_candidate_{0};
+  bool clock_epoch_pending_{false};
+  ESPPreferenceObject hop_preference_;
   ClockListenWindow clock_listen_{};
   uint32_t transaction_started_ms_{0}, settle_started_ms_{0}, clock_wait_started_ms_{0};
   uint32_t due_us_{0}, last_tx_us_{0}, tx_started_ms_{0}, window_started_ms_{0};
@@ -103,6 +115,7 @@ class RedLinkClimate : public RedLinkRadio, public climate::Climate {
   binary_sensor::BinarySensor *emergency_heat_{nullptr};
   RedLinkSystemModeSelect *system_mode_{nullptr};
   text_sensor::TextSensor *pairing_status_{nullptr};
+  text_sensor::TextSensor *discovery_status_{nullptr};
   text_sensor::TextSensor *heat_hold_until_{nullptr}, *cool_hold_until_{nullptr};
   binary_sensor::BinarySensor *paired_{nullptr};
 };

@@ -229,9 +229,9 @@ bool RedLinkRadio::enter_idle_() {
 void RedLinkRadio::setup() {
   if (this->parent_ == nullptr || this->cs_ == nullptr || this->gdo0_pin_ == nullptr || this->miso_pin_ == nullptr ||
       !this->cs_->is_internal() || static_cast<InternalGPIOPin *>(this->cs_)->is_inverted() ||
-      this->gdo0_pin_->is_inverted() || this->miso_pin_->is_inverted() || this->frequency_ < 902000000 ||
-      this->frequency_ > 928000000) {
-    this->fail_radio_("Invalid RedLINK SPI pins or frequency (requires 902-928 MHz)");
+      this->gdo0_pin_->is_inverted() || this->miso_pin_->is_inverted() || this->frequency_ < 903199706 ||
+      this->frequency_ > 905805439) {
+    this->fail_radio_("Invalid RedLINK SPI pins or tuning reference (all candidates must fit 902-928 MHz)");
     return;
   }
   this->gdo0_pin_->setup();
@@ -277,10 +277,12 @@ void RedLinkRadio::setup() {
       return;
     }
   }
-  const uint32_t frequency_word = (static_cast<uint64_t>(this->frequency_) * 65536ULL + 13000000ULL) / 26000000ULL;
+  const auto initial = candidate_channel(this->receive_candidate_);
+  const uint32_t initial_frequency = this->frequency_ + (int32_t(initial.channel) - 10) * 199951;
+  const uint32_t frequency_word = (uint64_t(initial_frequency) * 65536ULL + 13000000ULL) / 26000000ULL;
   const RegisterSetting channel[] = {
-      {SYNC1, static_cast<uint8_t>(this->sync_word_ >> 8)},
-      {SYNC0, static_cast<uint8_t>(this->sync_word_)},
+      {SYNC1, static_cast<uint8_t>(initial.sync >> 8)},
+      {SYNC0, static_cast<uint8_t>(initial.sync)},
       {FREQ2, static_cast<uint8_t>(frequency_word >> 16)},
       {static_cast<uint8_t>(FREQ2 + 1), static_cast<uint8_t>(frequency_word >> 8)},
       {static_cast<uint8_t>(FREQ2 + 2), static_cast<uint8_t>(frequency_word)},
@@ -308,30 +310,30 @@ void RedLinkRadio::dump_config() {
   LOG_SPI_DEVICE(this);
   LOG_PIN("  GDO0 sync interrupt: ", this->gdo0_pin_);
   LOG_PIN("  SO/MISO ready input: ", this->miso_pin_);
-  ESP_LOGCONFIG(TAG, "  Chip version: 0x%02X; requested carrier: %u Hz; sync: 0x%04X", this->chip_version_,
-                static_cast<unsigned>(this->frequency_), this->sync_word_);
+  ESP_LOGCONFIG(TAG, "  Chip version: 0x%02X; channel-10 tuning reference: %u Hz", this->chip_version_,
+                static_cast<unsigned>(this->frequency_));
   ESP_LOGCONFIG(TAG, "  GFSK BT=0.5; 38383.484 baud; deviation 19042.969 Hz; RX BW 101562.5 Hz");
-  ESP_LOGCONFIG(TAG, "  16-byte preamble; software PN9/CRC; nominal 0 dBm; TX channel-10/slot-0 only");
+  ESP_LOGCONFIG(TAG, "  16-byte preamble; software PN9/CRC; nominal 0 dBm; learned logical slot-0 TX only");
   ESP_LOGCONFIG(TAG, "  Sync timestamp: GPIO ISR minus 417 us; IDLE->RX/TX autocalibration enabled");
   ESP_LOGCONFIG(TAG, "  Receive-only enforcement: %s", receive_only_ ? "ON (TX blocked)" : "OFF");
 }
 
-bool RedLinkRadio::listen_slot_(uint8_t slot) {
-  if (slot >= HOP_CHANNELS.size() || this->tx_active_ || this->is_failed())
+bool RedLinkRadio::listen_candidate_(uint8_t rank) {
+  if (rank >= HOP_COUNT || this->tx_active_ || this->is_failed())
     return false;
-  if (slot == this->receive_slot_)
+  if (rank == this->receive_candidate_)
     return true;
   if (!this->enter_idle_())
     return false;
-  const auto &channel = HOP_CHANNELS[slot];
+  const auto channel = candidate_channel(rank);
   const uint32_t frequency = this->frequency_ + (int32_t(channel.channel) - 10) * 199951;
   const uint32_t word = (uint64_t(frequency) * 65536ULL + 13000000ULL) / 26000000ULL;
-  const uint16_t sync = slot == 0 ? this->sync_word_ : channel.sync;
+  const uint16_t sync = channel.sync;
   if (!this->write_register_(SYNC1, sync >> 8) || !this->write_register_(SYNC0, sync) ||
       !this->write_register_(FREQ2, word >> 16) || !this->write_register_(FREQ2 + 1, word >> 8) ||
       !this->write_register_(FREQ2 + 2, word))
     return false;
-  this->receive_slot_ = slot;
+  this->receive_candidate_ = rank;
   this->begin_rx();
   return !this->is_failed();
 }
@@ -466,7 +468,8 @@ bool RedLinkRadio::read_frame(Frame &frame, uint32_t &sync_start_us) {
 bool RedLinkRadio::send_frame(const Frame &frame) {
   this->tx_succeeded_ = false;
   if (receive_only_ || !transmit_enabled_ || !this->initialized_ || this->is_failed() || this->tx_active_ ||
-      this->receive_slot_ != 0 || frame.size < 4 || frame.size > 64 || !valid_frame(frame))
+      !hop_.ready() || receive_candidate_ != hop_.active_rank(0) || frame.size < 4 || frame.size > 64 ||
+      !valid_frame(frame))
     return false;
   if (!this->enter_idle_() || !this->strobe_(SFRX) || !this->strobe_(SFTX) || !this->write_register_(PKTCTRL0, 0x00) ||
       !this->write_register_(PKTLEN, static_cast<uint8_t>(frame.size)))

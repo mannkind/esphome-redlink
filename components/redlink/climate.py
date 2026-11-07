@@ -27,11 +27,16 @@ CONFIG_SCHEMA = (
         {
             cv.Required("gdo0_pin"): noninverted_input,
             cv.Required("miso_pin"): noninverted_input,
-            cv.Required("network_id"): cv.hex_uint16_t,
+            cv.Required("network_id"): cv.All(
+                cv.hex_uint16_t, cv.int_range(min=1, max=0xFFFE)
+            ),
             cv.Required("gateway_id"): cv.hex_uint16_t,
-            # Experimental defaults measured with ESP32-S3 + CC1101, not universal RF settings.
+            # Reference carrier for physical channel 10, not logical slot zero.
             cv.Optional("frequency", default=904195310): cv.int_range(
-                min=902000000, max=928000000
+                min=903199706, max=905805439
+            ),
+            cv.Optional("sync_word"): cv.invalid(
+                "sync_word is derived from the physical candidate channel; remove this option"
             ),
             cv.Optional("tx_advance_us", default=800): cv.int_range(
                 min=-10000, max=10000
@@ -41,6 +46,9 @@ CONFIG_SCHEMA = (
                 entity_category="diagnostic"
             ),
             cv.Optional("pairing_status"): text_sensor.text_sensor_schema(
+                entity_category="diagnostic"
+            ),
+            cv.Optional("discovery_status"): text_sensor.text_sensor_schema(
                 entity_category="diagnostic"
             ),
             cv.Optional("heat_hold_until"): text_sensor.text_sensor_schema(),
@@ -82,7 +90,13 @@ async def to_code(config):
         cg.add(getattr(var, f"set_{key}")(config[key]))
     cg.add(var.set_miso_pin(await cg.gpio_pin_expression(config["miso_pin"])))
     cg.add(var.set_receive_only(config["receive_only"]))
-    for key in ("result", "pairing_status", "heat_hold_until", "cool_hold_until"):
+    for key in (
+        "result",
+        "pairing_status",
+        "discovery_status",
+        "heat_hold_until",
+        "cool_hold_until",
+    ):
         if key in config:
             cg.add(
                 getattr(var, f"set_{key}_sensor")(

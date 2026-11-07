@@ -20,7 +20,6 @@ class RedLinkRadio : public Component,
   // The same physical SO/MISO pin configured on the SPI bus, not a second radio connection.
   void set_miso_pin(InternalGPIOPin *pin) { this->miso_pin_ = pin; }
   void set_frequency(uint32_t frequency) { this->frequency_ = frequency; }
-  void set_sync_word(uint16_t sync_word) { this->sync_word_ = sync_word; }
   void set_receive_only(bool value) { receive_only_ = value; }
   void set_radio_healthy_sensor(binary_sensor::BinarySensor *value) { radio_healthy_ = value; }
 
@@ -47,15 +46,15 @@ class RedLinkRadio : public Component,
   void disarm_sync_();
   void fail_radio_(const char *reason);
   virtual void on_radio_failure_() {}
-  bool listen_slot_(uint8_t slot);
+  bool listen_candidate_(uint8_t rank);
   bool receiving_() const { return rx_active_ || sync_pending_; }
 
   InternalGPIOPin *gdo0_pin_{nullptr};
   InternalGPIOPin *miso_pin_{nullptr};
   uint32_t frequency_{904195310};
-  uint16_t sync_word_{0x636e};
   uint8_t chip_version_{0};
-  uint8_t receive_slot_{0};
+  uint8_t receive_candidate_{0};
+  HopLearner hop_;
   bool initialized_{false};
   binary_sensor::BinarySensor *radio_healthy_{nullptr};
   bool receive_only_{true};
