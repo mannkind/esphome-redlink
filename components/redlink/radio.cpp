@@ -376,8 +376,7 @@ bool RedLinkRadio::read_frame(Frame &frame, uint32_t &sync_start_us) {
       this->rx_active_ = true;
     }
   }
-  if (this->rx_active_ && (micros() - this->rx_sync_end_us_ >= RX_PACKET_TIMEOUT_US ||
-                           micros() - this->rx_last_progress_us_ >= RX_STALL_TIMEOUT_US)) {
+  if (this->rx_active_ && micros() - this->rx_sync_end_us_ >= RX_PACKET_TIMEOUT_US) {
     this->begin_rx();
     return false;
   }
@@ -403,6 +402,14 @@ bool RedLinkRadio::read_frame(Frame &frame, uint32_t &sync_start_us) {
     return false;
   }
   if (!this->gdo0_pin_->digital_read()) {
+    this->begin_rx();
+    return false;
+  }
+  // A delayed loop is not a stalled receiver. Inspect the FIFO before applying
+  // the inactivity deadline: bytes can have arrived while another component ran.
+  // One byte must remain buffered for the CC1101 last-byte duplication erratum.
+  if (available <= 1 && (this->rx_expected_ == 0 || this->rx_expected_ - this->rx_frame_.size > available) &&
+      micros() - this->rx_last_progress_us_ >= RX_STALL_TIMEOUT_US) {
     this->begin_rx();
     return false;
   }

@@ -9,6 +9,7 @@ namespace redlink_test {
 void transfer_status(uint8_t *data, size_t size);
 uint8_t transfer_command(uint8_t command);
 void write_bytes(const uint8_t *data, size_t size);
+void read_bytes(uint8_t *data, size_t size);
 }  // namespace redlink_test
 namespace esphome::spi {
 constexpr int BIT_ORDER_MSB_FIRST = 0;
@@ -36,7 +37,10 @@ template<int, int, int, int> class SPIDevice {
     assert(selected_);
     return redlink_test::transfer_command(command);
   }
-  void read_array(uint8_t *, size_t) { assert(false); }
+  void read_array(uint8_t *data, size_t size) {
+    assert(selected_);
+    redlink_test::read_bytes(data, size);
+  }
   void write_array(const uint8_t *data, size_t size) {
     assert(selected_);
     redlink_test::write_bytes(data, size);

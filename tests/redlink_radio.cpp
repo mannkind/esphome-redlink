@@ -3,6 +3,7 @@
 #include "esphome/core/hal.h"
 
 #include "check.h"
+#include <algorithm>
 #include <cstdio>
 #include <initializer_list>
 #include <vector>
@@ -21,6 +22,7 @@ static bool emulate_registers = false, fifo_write = false;
 static uint8_t registers[64]{};
 static uint8_t marcstate = 1;
 static unsigned tx_strobes = 0;
+static std::vector<uint8_t> rx_fifo;
 
 static void advance(uint32_t duration) {
   now += duration;
@@ -53,6 +55,10 @@ uint8_t transfer_command(uint8_t command) {
     marcstate = 1;
   if (command == 0x34)
     marcstate = 0x0d;
+  if (command == 0x3a) {
+    rx_fifo.clear();
+    registers[0x3b] = 0;
+  }
   if (command == 0x3b)
     registers[0x3a] = 0;
   if (command == 0x35) {
@@ -72,6 +78,12 @@ void write_bytes(const uint8_t *data, size_t size) {
   CHECK(size == 2 && data[0] < 64);
   registers[data[0]] = data[1];
 }
+void read_bytes(uint8_t *data, size_t size) {
+  CHECK(emulate_registers && size <= rx_fifo.size());
+  std::copy_n(rx_fifo.begin(), size, data);
+  rx_fifo.erase(rx_fifo.begin(), rx_fifo.begin() + size);
+  registers[0x3b] = rx_fifo.size();
+}
 }  // namespace redlink_test
 
 namespace esphome {
@@ -90,6 +102,11 @@ class TestRadio : public esphome::redlink::RedLinkRadio {
   using RedLinkRadio::listen_candidate_;
   using RedLinkRadio::hop_;
   using RedLinkRadio::receive_candidate_;
+  void delayed_sync(uint32_t age) {
+    sync_end_us_ = esphome::micros() - age;
+    sync_pending_ = true;
+    gdo.high = true;
+  }
   void configure_bus() {
     parent_ = this;
     cs_ = &cs;
@@ -213,6 +230,34 @@ static void learned_channel_registers_and_tx_guard() {
   emulate_registers = false;
 }
 
+static void delayed_loop_keeps_buffered_packet(uint32_t start) {
+  using namespace redlink_test;
+  using namespace esphome::redlink;
+  reset(start);
+  emulate_registers = true;
+  TestRadio radio;
+  radio.configure_bus();
+  radio.setup();
+  const Frame expected = status_query(0x389e, 0xb14f);
+  rx_fifo.assign(expected.data.begin(), expected.data.begin() + expected.size);
+  whiten(rx_fifo.data(), rx_fifo.size());
+  registers[0x3b] = rx_fifo.size();
+  // Scheduling was delayed, but the CC1101 continued receiving correctly.
+  const uint32_t expected_sync = now - 5000 - 417;
+  radio.delayed_sync(5000);
+  Frame received;
+  uint32_t sync;
+  CHECK(radio.read_frame(received, sync));
+  CHECK(received.size == expected.size);
+  CHECK(std::equal(expected.data.begin(), expected.data.begin() + expected.size, received.data.begin()));
+  CHECK(sync == expected_sync);
+  // An empty FIFO really has stalled; reset it without accepting a frame.
+  radio.delayed_sync(5000);
+  CHECK(!radio.read_frame(received, sync));
+  CHECK(!radio.is_failed());
+  emulate_registers = false;
+}
+
 int main() {
   stale_read_crosses_deadline(0);
   stale_read_crosses_deadline(UINT32_MAX - 1500);
@@ -221,5 +266,7 @@ int main() {
   unstable_status();
   io_failure();
   learned_channel_registers_and_tx_guard();
+  delayed_loop_keeps_buffered_packet(10000);
+  delayed_loop_keeps_buffered_packet(UINT32_MAX - 1000);
   std::puts("RedLINK radio wait-state tests passed");
 }

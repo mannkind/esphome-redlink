@@ -73,7 +73,9 @@ beyond hours; a short rehearsal proves reception, not completion of all 50 slots
 - Current room temperature and humidity.
 
 Targets update optimistically in Home Assistant, then readback confirms them.
-Radio commands aren't instant. I haven't decoded actual heating/cooling activity.
+Radio commands aren't instant: the EIM repeats status replies across channels, so
+I leave 1.5 seconds after a query before transmitting again.
+I haven't decoded actual heating/cooling activity.
 The thermostat and EIM still control the equipment; this isn't a safety controller.
 
 ## Development

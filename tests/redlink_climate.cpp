@@ -130,6 +130,9 @@ class TestClimate : public RedLinkClimate {
   using RedLinkClimate::tx_allowed_;
   using RedLinkClimate::fresh_clock_;
   using RedLinkClimate::have_clock_counter_;
+  using RedLinkClimate::begin_exchange_;
+  using RedLinkClimate::due_us_;
+  using RedLinkClimate::transaction_started_ms_;
   binary_sensor::BinarySensor pending, verified, acknowledged, locked, emergency;
   text_sensor::TextSensor result;
   TestSystemModeSelect system_mode{this};
@@ -966,6 +969,38 @@ static void clock_epoch_reacquisition() {
   CHECK(conflict.hop_.known() == 1 && conflict.hop_.confirmed() == 0);
 }
 
+static void query_reply_train_blocks_next_write(uint64_t start) {
+  now_us = start;
+  TestClimate climate;
+  climate.clock_listen_.sync_us = micros() + 10000000;
+  climate.stage_ = TestClimate::Stage::BEFORE;
+  climate.transaction_started_ms_ = millis();
+  climate.begin_exchange_(status_query(0x389e, 0xb14f));
+  climate.schedule_();
+  now_us += static_cast<uint32_t>(climate.due_us_ - micros());
+  const unsigned before = transport_sends;
+  climate.loop();
+  CHECK(transport_sends == before + 1);
+  const uint32_t query_tx = climate.last_tx_us_;
+  climate.loop();  // Complete transport; no ACK is injected.
+  now_us += 450000;
+  climate.read_status(actual());
+  climate.requested_ = targets(71);
+  climate.stage_ = TestClimate::Stage::BEFORE;
+  climate.read_status(actual());
+  CHECK(climate.stage_ == TestClimate::Stage::WRITE);
+  climate.last_tx_us_ = query_tx;  // read_status injects a synthetic RX window.
+  climate.schedule_();
+  CHECK(climate.exchange_ == TestClimate::Exchange::SLOT);
+  // The first write must clear the final status copy, even if the query ACK
+  // was missed, and must not add a second-long retry after that train.
+  const uint32_t delay = climate.due_us_ - query_tx;
+  CHECK(delay >= 1500000 && delay < 1635000);
+  now_us += static_cast<uint32_t>(climate.due_us_ - micros());
+  climate.loop();
+  CHECK(transport_sends == before + 2);
+}
+
 int main() {
   cold_scanner_learns_unknown_order();
   clock_epoch_reacquisition();
@@ -989,5 +1024,7 @@ int main() {
   stale_prewrite_reply(1000000);
   stale_prewrite_reply(200);  // Timestamp comparison remains valid across micros() wrap.
   CHECK(transport_sends == 0);
+  query_reply_train_blocks_next_write(1000000);
+  query_reply_train_blocks_next_write(0xffffffffULL - 600000);
   std::puts("RedLINK climate control tests passed");
 }

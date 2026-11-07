@@ -91,6 +91,7 @@ class RedLinkClimate : public RedLinkRadio, public climate::Climate {
   ClockListenWindow clock_listen_{};
   uint32_t transaction_started_ms_{0}, settle_started_ms_{0}, clock_wait_started_ms_{0};
   uint32_t due_us_{0}, last_tx_us_{0}, tx_started_ms_{0}, window_started_ms_{0};
+  uint32_t tx_spacing_us_{1000000};
   uint32_t last_refresh_ms_{0}, retry_after_ms_{0};
   int32_t tx_advance_us_{0};
   Control requested_{};

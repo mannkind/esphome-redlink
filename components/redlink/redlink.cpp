@@ -591,7 +591,7 @@ void RedLinkClimate::schedule_() {
   // the anchor expire and delay the next command while we reacquire it.
   const uint32_t before_tune = micros();
   const uint32_t since_previous_tx = before_tune - last_tx_us_;
-  const uint32_t spacing_us = sent_any_ && since_previous_tx < 1000000 ? 1000000 - since_previous_tx : 0;
+  const uint32_t spacing_us = sent_any_ && since_previous_tx < tx_spacing_us_ ? tx_spacing_us_ - since_previous_tx : 0;
   const uint32_t reply_budget_us = stage_ == Stage::WRITE ? 200000 : 450000;  // TX timeout + reply window.
   const int32_t until_clock = static_cast<int32_t>(clock_listen_.sync_us - before_tune);
   const uint32_t occupied_us = spacing_us + static_cast<uint32_t>(std::ceil(CYCLE_US)) + reply_budget_us + 8000;
@@ -611,7 +611,7 @@ void RedLinkClimate::schedule_() {
   const double base = 18 * TICK_US - clock_phase_ticks_ * TICK_US - PREAMBLE_US - tx_advance_us_;
   const int32_t elapsed = static_cast<int32_t>(now - clock_sync_us_);
   const uint32_t since_tx = now - last_tx_us_;
-  const int32_t spacing = sent_any_ && since_tx < 1000000 ? 1000000 - since_tx : 0;
+  const int32_t spacing = sent_any_ && since_tx < tx_spacing_us_ ? tx_spacing_us_ - since_tx : 0;
   const double earliest = elapsed + std::max<int32_t>(spacing, 2000);
   const double cycle = std::ceil((earliest - base) / CYCLE_US);
   due_us_ = clock_sync_us_ + static_cast<int32_t>(std::llround(base + cycle * CYCLE_US));
@@ -1075,6 +1075,10 @@ void RedLinkClimate::loop() {
         break;
       }
       last_tx_us_ = micros();
+      // A query produces ten status copies across successive channels, ending
+      // about 1.36 s after TX. Sending at the old 1 s floor collides with that
+      // train. Keep this guard even without an ACK: missing it proves no failure.
+      tx_spacing_us_ = outgoing_.data[1] == 0x10 ? 1500000 : 1000000;
       sent_any_ = true;
       attempts_++;
       saw_ack_ = false;
