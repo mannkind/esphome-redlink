@@ -133,6 +133,9 @@ class TestClimate : public RedLinkClimate {
   using RedLinkClimate::begin_exchange_;
   using RedLinkClimate::due_us_;
   using RedLinkClimate::transaction_started_ms_;
+  using RedLinkClimate::recovery_candidate_;
+  using RedLinkClimate::recovery_started_ms_;
+  using RedLinkClimate::clock_published_;
   binary_sensor::BinarySensor pending, verified, acknowledged, locked, emergency;
   text_sensor::TextSensor result;
   TestSystemModeSelect system_mode{this};
@@ -210,14 +213,60 @@ static void measured_climate_traits_and_initial_unknown() {
   echo.thermostat[4] = 0x9a;
   climate.read_status(echo);
   CHECK(climate.stage_ == TestClimate::Stage::BEFORE && climate.pending.state);
-  CHECK(std::isnan(climate.publications.back().temperature) && std::isnan(climate.publications.back().humidity));
-  CHECK(climate.target_temperature_low == 72);
+  CHECK(climate.publications.empty());
+  CHECK(std::isnan(climate.target_temperature_low) && std::isnan(climate.target_temperature_high));
   climate.finish_("no actual status", false);
   CHECK(std::isnan(climate.current_temperature) && std::isnan(climate.current_humidity));
+  CHECK(climate.publications.empty());
   climate.refresh();
   climate.read_status(odd_room_actual());
   CHECK(climate.current_temperature == 71 && climate.target_temperature_low == 70);
   CHECK(climate.publications.back().temperature == 71 && climate.publications.back().humidity == 99);
+}
+
+static void startup_refresh_waits_for_actual_and_preserves_confirmed() {
+  TestClimate climate;
+  CHECK(climate.publications.empty());
+  climate.refresh();
+  CHECK(climate.stage_ == TestClimate::Stage::BEFORE && climate.publications.empty());
+  CHECK(!climate.pending.state);
+  Status off = actual();
+  off.thermostat[19] = 0xfa;  // Actual Off is known, unlike the boot default OFF.
+  Status partial = off;
+  partial.have_fan = false;
+  climate.publish_status_(partial);
+  partial = off;
+  partial.have_thermostat = false;
+  climate.publish_status_(partial);
+  Status echo = off;
+  echo.thermostat[4] = 0x9a;
+  climate.read_status(echo);
+  CHECK(climate.publications.empty() && !climate.confirmed_status_.complete());
+  climate.finish_("initial refresh timed out", false);
+  CHECK(climate.publications.empty() && !climate.pending.state);
+  CHECK(std::isnan(climate.target_temperature_low) && std::isnan(climate.target_temperature_high));
+  CHECK(!climate.fan_mode.has_value() && climate.get_custom_preset().empty());
+
+  climate.refresh();
+  climate.read_status(off);
+  CHECK(!climate.publications.empty() && climate.stage_ == TestClimate::Stage::IDLE);
+  CHECK(climate.publications.back().mode == climate::CLIMATE_MODE_OFF);
+  CHECK(climate.target_temperature_low == 70 && climate.target_temperature_high == 74);
+  CHECK(climate.system_mode.current_option() == "Off" && climate.get_custom_fan_mode() == "circulate");
+  const auto confirmed = climate.publications.back();
+  const auto fan = climate.fan_mode;
+  const auto preset = climate.get_custom_preset();
+  climate.refresh();
+  climate.read_status(echo);
+  climate.finish_("subsequent refresh timed out", false);
+  CHECK(climate.confirmed_status_.thermostat == off.thermostat);
+  CHECK(climate.confirmed_status_.fan == off.fan);
+  CHECK(climate.publications.back().mode == confirmed.mode);
+  CHECK(climate.publications.back().low == confirmed.low && climate.publications.back().high == confirmed.high);
+  CHECK(climate.publications.back().temperature == confirmed.temperature);
+  CHECK(climate.publications.back().humidity == confirmed.humidity);
+  CHECK(climate.fan_mode == fan && climate.get_custom_preset() == preset);
+  CHECK(!climate.pending.state && !climate.verified.state);
 }
 
 static void measurements_are_independently_guarded() {
@@ -307,11 +356,20 @@ static void immediate_optimism_and_rollback() {
   TestClimate unknown;
   unknown.request_control_(targets(71));
   CHECK(unknown.pending.state && !unknown.verified.state);
-  CHECK(unknown.target_temperature_low == 71 && std::isnan(unknown.target_temperature_high));
+  CHECK(std::isnan(unknown.target_temperature_low) && std::isnan(unknown.target_temperature_high));
+  CHECK(unknown.publications.empty());
   CHECK(!unknown.confirmed_status_.complete());
+  Control mode_and_fan;
+  mode_and_fan.mode = 1;
+  mode_and_fan.fan = 1;
+  unknown.request_control_(mode_and_fan);
+  CHECK(unknown.requested_.heat == 71 && unknown.requested_.mode == 1 && unknown.requested_.fan == 1);
+  CHECK(unknown.pending.state && unknown.publications.empty());
+  CHECK(std::isnan(unknown.target_temperature_low) && !unknown.fan_mode.has_value());
   unknown.finish_("no clock", false);
   CHECK(!unknown.pending.state && !unknown.verified.state);
   CHECK(std::isnan(unknown.target_temperature_low) && std::isnan(unknown.target_temperature_high));
+  CHECK(unknown.publications.empty());
 
   TestClimate climate;
   const Status baseline = actual();
@@ -734,10 +792,11 @@ static void expanded_target_range_and_deadband() {
   CHECK(climate.queued_control_.cool == 78 && climate.target_temperature_high == 78);
   climate.finish_("cancel", false);
 
-  // Unknown opposite target stays unknown; fresh status remains the final write gate.
+  // Unknown state stays unpublished; fresh status remains the final write gate.
   TestClimate unknown;
   unknown.request_control_(targets(78));
-  CHECK(unknown.pending.state && unknown.target_temperature_low == 78 && std::isnan(unknown.target_temperature_high));
+  CHECK(unknown.pending.state && unknown.publications.empty());
+  CHECK(std::isnan(unknown.target_temperature_low) && std::isnan(unknown.target_temperature_high));
   unknown.read_status(actual());
   CHECK(!unknown.pending.state && !unknown.verified.state && unknown.write_count_ == 0);
   CHECK(unknown.target_temperature_low == 70 && unknown.target_temperature_high == 74);
@@ -1001,13 +1060,43 @@ static void query_reply_train_blocks_next_write(uint64_t start) {
   CHECK(transport_sends == before + 2);
 }
 
+static void recovery_hint_is_receive_only_and_bounded() {
+  now_us = 1000000;
+  TestClimate climate;
+  HopMapRecord record{};
+  CHECK(climate.hop_.save(record, 0x389e, 904195310));
+  CHECK(climate.hop_.load(record, 0x389e, 904195310));
+  climate.have_clock_ = climate.have_clock_counter_ = false;
+  climate.recovery_candidate_ = 7;
+  climate.recovery_started_ms_ = millis();
+  climate.listen_for_clock_();
+  CHECK(climate.receive_candidate_ == 7);
+  CHECK(!climate.fresh_clock_() && !climate.tx_allowed_());
+  now_us += 19999000;
+  climate.listen_for_clock_();
+  CHECK(climate.receive_candidate_ == 7);
+  now_us += 1000;
+  climate.listen_for_clock_();
+  CHECK(climate.recovery_candidate_ == UNKNOWN_CHANNEL);
+  CHECK(climate.receive_candidate_ != 7);
+  CHECK(!climate.fresh_clock_() && !climate.tx_allowed_());
+  TestClimate validated;
+  validated.clock_published_ = false;
+  validated.loop();
+  CHECK(validated.stage_ == TestClimate::Stage::BEFORE);
+  CHECK(!actual_status(validated.confirmed_status_));
+  CHECK(validated.write_count_ == 0);
+}
+
 int main() {
+  recovery_hint_is_receive_only_and_bounded();
   cold_scanner_learns_unknown_order();
   clock_epoch_reacquisition();
   live_learning_cache_and_duplicates();
   passive_discovery_and_dynamic_slot_zero();
   confirmed_hold_deadlines();
   measured_climate_traits_and_initial_unknown();
+  startup_refresh_waits_for_actual_and_preserves_confirmed();
   measurements_are_independently_guarded();
   measurements_during_optimism_verification_and_rollback();
   system_mode_selection_and_no_op();

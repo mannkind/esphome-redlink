@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#ifdef USE_ESP32
+#include "esp_attr.h"
+#include "esp_system.h"
+#endif
 
 namespace esphome::redlink {
 static const char *const TAG = "redlink";
@@ -15,6 +19,16 @@ static constexpr uint32_t PAIRING_MAGIC = 0x524c0001;
 static constexpr std::array<uint8_t, 5> SYSTEM_MODE_CODES{4, 1, 3, 2, 0};
 
 namespace {
+#ifdef USE_ESP32
+// Retained RAM is only a receive-channel hint, never a clock or TX authorization.
+// No flash writes; power-on and changed firmware layouts fall back to discovery.
+struct RecoveryHint {
+  uint32_t magic, frequency;
+  uint16_t network;
+  uint8_t candidate, check;
+};
+RTC_NOINIT_ATTR RecoveryHint recovery_hint;
+#endif
 bool has_control(const Control &c) {
   return c.heat != -1 || c.cool != -1 || c.mode != -1 || c.fan != -1 || c.hold != -1 || c.until != -1;
 }
@@ -79,6 +93,18 @@ void RedLinkClimate::setup() {
     if (hop_preference_.load(&record) && hop_.load(record, network_, frequency_))
       map_saved_ = true;
   }
+#ifdef USE_ESP32
+  if (esp_reset_reason() == ESP_RST_SW && hop_.cached() && recovery_hint.magic == 0x524c4801 &&
+      recovery_hint.frequency == frequency_ && recovery_hint.network == network_ &&
+      recovery_hint.candidate < HOP_COUNT && recovery_hint.check == uint8_t(recovery_hint.candidate ^ 0xa5)) {
+    recovery_candidate_ = recovery_hint.candidate;
+    recovery_started_ms_ = millis();
+    listen_candidate_(recovery_candidate_);
+    ESP_LOGI(TAG, "Warm restart: listening on saved clock candidate %u; fresh clocks still required",
+             unsigned(recovery_candidate_));
+  }
+  recovery_hint.magic = 0;
+#endif
   if (paired_ != nullptr)
     paired_->publish_state(paired_state_);
   report_pairing_(paired_state_ ? "Previously verified; not checked this boot"
@@ -238,6 +264,16 @@ bool RedLinkClimate::track_clock_(uint8_t slot, uint32_t counter, uint32_t phase
   clock_sync_us_ = sync_us;
   clock_phase_ticks_ = phase;
   clock_received_ms_ = now;
+#ifdef USE_ESP32
+  if (have_clock_ && hop_.ready()) {
+    // Four clock copies span adjacent slots. The third slot of the next burst
+    // overlaps the next three broadcast windows, tolerating a short reboot.
+    const uint8_t first_next = (next.slot + HOP_COUNT - next.copy) % HOP_COUNT;
+    const uint8_t target = (first_next + (next.copy == 0 ? 2 : 3)) % HOP_COUNT;
+    const uint8_t candidate = hop_.active_rank(target);
+    recovery_hint = {0x524c4801, frequency_, network_, candidate, uint8_t(candidate ^ 0xa5)};
+  }
+#endif
   clock_listen_ = next;
   clock_listen_.sync_us += sync_us;
   if (!have_clock_)
@@ -271,6 +307,10 @@ void RedLinkClimate::rediscover_channels() {
   hop_.reset(true);
   have_clock_ = have_clock_counter_ = false;
   clock_epoch_pending_ = false;
+  recovery_candidate_ = UNKNOWN_CHANNEL;
+#ifdef USE_ESP32
+  recovery_hint.magic = 0;
+#endif
   map_saved_ = false;
   scan_trials_.fill(0);
   scan_changed_ms_ = millis();
@@ -314,6 +354,14 @@ void RedLinkClimate::listen_for_clock_() {
     scan_window_us_ = clock_listen_.sync_us;
     scan_changed_ms_ = now;
     return;
+  }
+  if (recovery_candidate_ != UNKNOWN_CHANNEL) {
+    if (now - recovery_started_ms_ < 20000) {
+      listen_candidate_(recovery_candidate_);
+      return;
+    }
+    recovery_candidate_ = UNKNOWN_CHANNEL;
+    ESP_LOGI(TAG, "Warm restart hint expired; resuming passive scan");
   }
   // Visit every unassigned candidate in order. Larger strides can form a closed
   // subset once assigned channels are skipped. Vary dwell to avoid phase lock.
@@ -811,40 +859,42 @@ void RedLinkClimate::apply_requested_(const Control &c) {
 }
 
 void RedLinkClimate::publish_climate_() {
+  if (command_pending_ != nullptr)
+    command_pending_->publish_state(command_pending_awaiting_());
+  // Publishing even the default OFF marks the native API entity as known.
+  // Keep requests diagnostic-only until actual thermostat AND fan readback exists.
+  if (!actual_status(confirmed_status_))
+    return;
   // Rebuild from confirmed readback every time; never let an optimistic value
   // become the rollback baseline or feed write preparation.
   const Status &s = confirmed_status_;
-  target_temperature_low = s.complete() ? s.thermostat[7] : NAN;
-  target_temperature_high = s.complete() ? s.thermostat[8] : NAN;
+  target_temperature_low = s.thermostat[7];
+  target_temperature_high = s.thermostat[8];
   mode = climate::CLIMATE_MODE_OFF;
   fan_mode.reset();
   preset.reset();
   this->clear_custom_fan_mode_();
   this->clear_custom_preset_();
-  if (s.complete()) {
-    Control confirmed;
-    confirmed.mode = s.thermostat[19] & 7;
-    confirmed.fan = s.fan[9] & 3;
-    apply_requested_(confirmed);
-    const unsigned heat_hold = (s.thermostat[9] >> 3) & 3;
-    const unsigned cool_hold = (s.thermostat[9] >> 5) & 3;
-    const char *hold = "mixed";
-    if (heat_hold == cool_hold) {
-      if (heat_hold == 0)
-        hold = "schedule";
-      else if (heat_hold == 1)
-        hold = "temporary";
-      else if (heat_hold == 2)
-        hold = "permanent";
-    }
-    this->set_custom_preset_(hold);
+  Control confirmed;
+  confirmed.mode = s.thermostat[19] & 7;
+  confirmed.fan = s.fan[9] & 3;
+  apply_requested_(confirmed);
+  const unsigned heat_hold = (s.thermostat[9] >> 3) & 3;
+  const unsigned cool_hold = (s.thermostat[9] >> 5) & 3;
+  const char *hold = "mixed";
+  if (heat_hold == cool_hold) {
+    if (heat_hold == 0)
+      hold = "schedule";
+    else if (heat_hold == 1)
+      hold = "temporary";
+    else if (heat_hold == 2)
+      hold = "permanent";
   }
+  this->set_custom_preset_(hold);
   if (stage_ == Stage::BEFORE || stage_ == Stage::WRITE || stage_ == Stage::VERIFY)
     apply_requested_(requested_);
   if (have_queued_control_)
     apply_requested_(queued_control_);
-  if (command_pending_ != nullptr)
-    command_pending_->publish_state(command_pending_awaiting_());
   publish_state();
 }
 
@@ -1014,6 +1064,10 @@ void RedLinkClimate::loop() {
     clock_published_ = locked;
     if (clock_locked_ != nullptr)
       clock_locked_->publish_state(locked);
+    // Once a boot cache is validated, read actual state immediately rather than
+    // waiting for the one-minute background poll. This never sends HVAC writes.
+    if (locked && stage_ == Stage::IDLE && !have_queued_control_ && !actual_status(confirmed_status_) && tx_allowed_())
+      refresh();
   }
   if (stage_ == Stage::IDLE || exchange_ == Exchange::CLOCK || exchange_ == Exchange::SETTLE)
     listen_for_clock_();

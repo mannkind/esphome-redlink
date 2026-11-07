@@ -48,6 +48,8 @@ Commands are rejected while learning, rather than queued into short transaction 
 
 Only a complete map is saved, with version, network, tuning reference, and checksum.
 After reboot two independent matching live clocks must validate the cache before TX.
+Software restarts try a retained receive-channel hint for up to 20 seconds.
+Power loss or a stale hint falls back to scanning; neither bypasses clock validation.
 Clock acquisition/reacquisition also checks counter progression against elapsed RF
 time; `Clock provisional:` is not a lock. After an EIM reset or long outage,
 `Clock epoch reacquired` retains the confirmed map, drops single-observation credit,
@@ -73,6 +75,7 @@ beyond hours; a short rehearsal proves reception, not completion of all 50 slots
 - Current room temperature and humidity.
 
 Targets update optimistically in Home Assistant, then readback confirms them.
+After boot, climate state stays unknown until the first actual readback.
 Radio commands aren't instant: the EIM repeats status replies across channels, so
 I leave 1.5 seconds after a query before transmitting again.
 I haven't decoded actual heating/cooling activity.

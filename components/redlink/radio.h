@@ -23,7 +23,8 @@ class RedLinkRadio : public Component,
   void set_receive_only(bool value) { receive_only_ = value; }
   void set_radio_healthy_sensor(binary_sensor::BinarySensor *value) { radio_healthy_ = value; }
 
-  // Call frequently from the owning component's loop. RX is rearmed after every packet/error.
+  // Short RX frames are hardware-bounded; >64-byte frames need frequent FIFO service.
+  // RX is rearmed after every packet/error, with the original ISR sync timestamp retained.
   bool read_frame(Frame &frame, uint32_t &sync_start_us);
   // Starts fixed-length TX; never waits for the packet to finish. Call begin_rx() after tx_finished().
   bool send_frame(const Frame &frame);
@@ -62,6 +63,7 @@ class RedLinkRadio : public Component,
   bool rx_running_{false};
   bool rx_active_{false};
   bool tx_active_{false};
+  bool rx_infinite_{false};
   bool tx_succeeded_{false};
   uint32_t tx_started_us_{0};
   uint32_t tx_timeout_us_{0};

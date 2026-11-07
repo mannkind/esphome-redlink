@@ -58,7 +58,7 @@ constexpr RegisterSetting SETTINGS[] = {
     {0x01, 0x2e},                    // GDO1/SO high impedance whenever CS is high.
     {IOCFG0, 0x06},   {0x03, 0x47},  // ADC retention for narrow RX filter; FIFO threshold 32 bytes.
     {PKTLEN, 64},     {0x07, 0x00},  // No appended status, autoflush, or address filtering.
-    {PKTCTRL0, 0x02},                // FIFO packet format, infinite RX length, no CRC/whitening.
+    {PKTCTRL0, 0x00},                // Fixed-length RX cap; software decodes the whitened length.
     {0x09, 0x00},     {0x0a, 0x00},  // CHANNR=0: frequency_ is the actual channel-10 carrier, not a hop base.
     {0x0b, 0x06},                    // 152.344 kHz IF.
     {0x0c, 0x00},     {0x10, 0xca},  // RX bandwidth 101.5625 kHz; data-rate exponent 10.
@@ -66,7 +66,7 @@ constexpr RegisterSetting SETTINGS[] = {
     {0x13, 0x62},                    // No FEC; 16 preamble bytes.
     {0x14, 0xf8},     {0x15, 0x34},  // +/-19042.96875 Hz deviation.
     {0x16, 0x07},                    // No RX termination timer.
-    {0x17, 0x00},                    // No CCA; TX ends in IDLE. RX is terminated manually.
+    {0x17, 0x00},                    // No CCA; TX and bounded RX end in IDLE.
     {0x18, 0x18},                    // Calibrate on every IDLE -> RX/TX, regulator timeout 64 cycles.
     {0x19, 0x16},     {0x1a, 0x6c}, {0x1b, 0x43},   {0x1c, 0x40},
     {0x1d, 0x91},     {0x21, 0x56}, {0x22, 0x10},  // PATABLE index zero, no PA ramp table.
@@ -341,12 +341,13 @@ bool RedLinkRadio::listen_candidate_(uint8_t rank) {
 void RedLinkRadio::begin_rx() {
   if (!this->initialized_ || this->is_failed() || this->tx_active_)
     return;
-  if (!this->enter_idle_() || !this->strobe_(SFRX) || !this->write_register_(PKTCTRL0, 0x02) ||
+  if (!this->enter_idle_() || !this->strobe_(SFRX) || !this->write_register_(PKTCTRL0, 0x00) ||
       !this->write_register_(PKTLEN, 64))
     return;
   this->rx_frame_.size = 0;
   this->rx_expected_ = 0;
   this->rx_active_ = false;
+  this->rx_infinite_ = false;
   {
     InterruptLock lock;
     this->sync_pending_ = false;
@@ -376,14 +377,16 @@ bool RedLinkRadio::read_frame(Frame &frame, uint32_t &sync_start_us) {
       this->rx_active_ = true;
     }
   }
-  if (this->rx_active_ && micros() - this->rx_sync_end_us_ >= RX_PACKET_TIMEOUT_US) {
-    this->begin_rx();
+  // Observe buffered completion before applying a wall-clock deadline. A late
+  // caller must not discard a packet the hardware already received and stopped.
+  const bool expired = this->rx_active_ && micros() - this->rx_sync_end_us_ >= RX_PACKET_TIMEOUT_US;
+  const bool stopped = this->rx_active_ && !this->gdo0_pin_->digital_read();
+  uint8_t bytes;
+  if (!this->read_stable_status_(RXBYTES, bytes)) {
+    if (expired && !this->is_failed())
+      this->begin_rx();
     return false;
   }
-
-  uint8_t bytes;
-  if (!this->read_stable_status_(RXBYTES, bytes))
-    return false;
   const size_t available = bytes & 0x7f;
   if ((bytes & 0x80) != 0 || available > 64) {
     this->begin_rx();
@@ -401,25 +404,21 @@ bool RedLinkRadio::read_frame(Frame &frame, uint32_t &sync_start_us) {
       this->begin_rx();
     return false;
   }
-  if (!this->gdo0_pin_->digital_read()) {
-    this->begin_rx();
+  // A GDO falling edge after the status observation can make its FIFO count
+  // stale. Hardware is now stopped: keep the packet for a fresh next-loop read.
+  if (!stopped && !this->gdo0_pin_->digital_read())
     return false;
-  }
-  // A delayed loop is not a stalled receiver. Inspect the FIFO before applying
-  // the inactivity deadline: bytes can have arrived while another component ran.
-  // One byte must remain buffered for the CC1101 last-byte duplication erratum.
-  if (available <= 1 && (this->rx_expected_ == 0 || this->rx_expected_ - this->rx_frame_.size > available) &&
-      micros() - this->rx_last_progress_us_ >= RX_STALL_TIMEOUT_US) {
-    this->begin_rx();
-    return false;
-  }
 
   size_t unread = available;
   if (this->rx_expected_ == 0) {
-    // Infinite RX: the first *whitened* byte is NOT a CC1101 hardware length byte.
-    // Leave one byte in the active FIFO (CC1101 last-byte duplication erratum).
-    if (unread < 2)
+    // The first whitened byte is not a hardware length byte. Start with a
+    // 64-byte fixed cap so post-frame noise cannot overflow a short packet
+    // while the main loop is delayed. Never empty an active FIFO (SWRZ020E).
+    if (unread < 2) {
+      if (expired || stopped || micros() - this->rx_last_progress_us_ >= RX_STALL_TIMEOUT_US)
+        this->begin_rx();
       return false;
+    }
     if (!this->read_fifo_(this->rx_frame_.data.data(), 1))
       return false;
     this->rx_frame_.size = 1;
@@ -432,12 +431,29 @@ bool RedLinkRadio::read_frame(Frame &frame, uint32_t &sync_start_us) {
     }
     this->rx_expected_ = static_cast<size_t>(length) + 3;
     this->rx_last_progress_us_ = micros();
+    if (this->rx_expected_ > 64) {
+      // TI SWRS061I 15.2.1: PKTLEN can be extended during RX. If the first
+      // FIFO has already filled and stopped, this longer packet is truncated.
+      if (expired || !this->gdo0_pin_->digital_read()) {
+        this->begin_rx();
+        return false;
+      }
+      // 256..258 bytes need the modulo-256 counter (15.2.2). Keep infinite
+      // mode only until we have read past the first occurrence of that count.
+      if (this->rx_expected_ > 255) {
+        if (!this->write_register_(PKTCTRL0, 0x02))
+          return false;
+        this->rx_infinite_ = true;
+      }
+      if (!this->write_register_(PKTLEN, static_cast<uint8_t>(this->rx_expected_)))
+        return false;
+    }
   }
 
   const size_t remaining = this->rx_expected_ - this->rx_frame_.size;
   if (unread >= remaining) {
-    // Infinite mode never signals packet-end. Stop the receiver BEFORE draining the final byte,
-    // even if subsequent noise bytes have already arrived; only length+payload+CRC is accepted.
+    // Stop before draining the last byte, including when our short-packet
+    // safety cap has not yet been reached. Never accept trailing noise.
     if (!this->enter_idle_())
       return false;
     uint8_t stopped_bytes;
@@ -462,6 +478,14 @@ bool RedLinkRadio::read_frame(Frame &frame, uint32_t &sync_start_us) {
     this->begin_rx();
     return valid;
   }
+  // Low GDO now denotes a hardware packet end, not necessarily an error.
+  // It is an error only when the declared frame is still incomplete.
+  if (!stopped && !this->gdo0_pin_->digital_read())
+    return false;
+  if (expired || stopped || (unread <= 1 && micros() - this->rx_last_progress_us_ >= RX_STALL_TIMEOUT_US)) {
+    this->begin_rx();
+    return false;
+  }
   if (unread <= 1)
     return false;
   const size_t count = std::min(unread - 1, remaining);
@@ -469,6 +493,11 @@ bool RedLinkRadio::read_frame(Frame &frame, uint32_t &sync_start_us) {
     return false;
   this->rx_frame_.size += count;
   this->rx_last_progress_us_ = micros();
+  if (this->rx_infinite_ && this->rx_frame_.size > (this->rx_expected_ & 0xff)) {
+    if (!this->write_register_(PKTCTRL0, 0x00))
+      return false;
+    this->rx_infinite_ = false;
+  }
   return false;
 }
 

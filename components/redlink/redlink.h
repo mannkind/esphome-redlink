@@ -82,6 +82,8 @@ class RedLinkClimate : public RedLinkRadio, public climate::Climate {
   uint8_t attempts_{0};
   uint32_t clock_sync_us_{0}, clock_phase_ticks_{0}, clock_received_ms_{0};
   uint32_t scan_changed_ms_{0}, scan_round_{0}, scan_window_us_{0};
+  uint8_t recovery_candidate_{UNKNOWN_CHANNEL};
+  uint32_t recovery_started_ms_{0};
   std::array<uint8_t, HOP_COUNT> scan_trials_{};
   uint32_t last_clock_counter_{0};
   bool have_clock_counter_{false}, map_saved_{false};
