@@ -654,6 +654,12 @@ void RedLinkClimate::schedule_() {
     finish_("Could not tune the verified transmit channel; no packet sent", false);
     return;
   }
+  // FIFO loading and SPI status reads can take milliseconds under interrupt load.
+  // Finish them before choosing the slot; only STX belongs on its deadline.
+  if (!prepare_frame(outgoing_)) {
+    finish_("Radio refused TX preparation; no packet sent", false);
+    return;
+  }
   const uint32_t now = micros();
   // Clock counters refer to the FIRST sync bit, not FIFO delivery or preamble.
   const double base = 18 * TICK_US - clock_phase_ticks_ * TICK_US - PREAMBLE_US - tx_advance_us_;
@@ -667,7 +673,7 @@ void RedLinkClimate::schedule_() {
 }
 
 void RedLinkClimate::received_(const Frame &frame, uint32_t sync_us) {
-  ESP_LOGI(TAG, "RX CRC-valid: %u bytes, type 0x%02x, channel %u", unsigned(frame.size), frame.data[1],
+  ESP_LOGD(TAG, "RX CRC-valid: %u bytes, type 0x%02x, channel %u", unsigned(frame.size), frame.data[1],
            candidate_channel(receive_candidate_).channel);
   uint8_t slot;
   uint32_t phase, counter;
@@ -730,6 +736,21 @@ void RedLinkClimate::received_(const Frame &frame, uint32_t sync_us) {
   if (!collect_status(frame, received_status_))
     return;  // collect_status validated every block/separator; pending blocks invalidate,
   // rather than replace, the corresponding accumulated actual status.
+  // A prompt directed ACK stops the EIM's ten-copy reply train. Never ACK an
+  // unvalidated block or extend this fast path to enrollment/registry traffic.
+  if (!reply_ack_attempted_ && outgoing_.data[1] == 0x10 && tx_allowed_() && fresh_clock_()) {
+    reply_ack_attempted_ = true;
+    reply_end_us_ = sync_us + 417 + (frame.size * 8000000UL + 38382) / 38383;
+    if (static_cast<int32_t>(micros() - reply_end_us_) >= 0 && prepare_frame(status_reply_ack(network_, gateway_)) &&
+        static_cast<int32_t>(micros() - reply_end_us_) + static_cast<int32_t>(std::lround(PREAMBLE_US)) + 1000 <=
+            6000 &&
+        tx_allowed_() && fresh_clock_() && start_tx()) {
+      sending_reply_ack_ = true;
+      tx_started_ms_ = millis();
+      exchange_ = Exchange::TX;
+      return;
+    }
+  }
   const size_t end = frame.size - 2;
   for (size_t position = 11; position < end;) {
     const uint8_t *block = frame.data.data() + position;
@@ -1042,6 +1063,16 @@ void RedLinkClimate::loop() {
       return;
     }
     const bool success = tx_succeeded() && !this->is_failed();
+    const bool reply_ack = sending_reply_ack_;
+    sending_reply_ack_ = false;
+    uint32_t transmitted_sync = 0;
+    bool have_transmitted_sync;
+    {
+      InterruptLock lock;
+      have_transmitted_sync = sync_pending_;
+      if (have_transmitted_sync)
+        transmitted_sync = sync_end_us_ - 417;
+    }
     if (stage_ == Stage::PAIRING)
       enrollment_.transport_complete(success);
     begin_rx();
@@ -1051,14 +1082,29 @@ void RedLinkClimate::loop() {
       exchange_ = Exchange::CLOCK;
       return;
     }
-    window_started_ms_ = millis();
+    if (reply_ack) {
+      const int32_t gap = static_cast<int32_t>(transmitted_sync - reply_end_us_);
+      // A late/missing GPIO timestamp cannot justify shortening the train guard.
+      const bool timely = have_transmitted_sync && gap >= 0 && gap <= 6000;
+      if (timely)
+        tx_spacing_us_ = 500000;
+      ESP_LOGI(TAG, "Status reply ACK sent: sync gap=%ld us; fast spacing=%u", static_cast<long>(gap),
+               unsigned(timely));
+    } else {
+      window_started_ms_ = millis();
+    }
     exchange_ = Exchange::RX;
     return;
   }
   Frame frame;
   uint32_t sync_us;
-  if (read_frame(frame, sync_us))
+  if (read_frame(frame, sync_us)) {
     received_(frame, sync_us);
+    if (sending_reply_ack_)
+      return;
+    if (!rx_running_)
+      begin_rx();
+  }
   const bool locked = fresh_clock_();
   if (locked != clock_published_) {
     clock_published_ = locked;
@@ -1121,7 +1167,7 @@ void RedLinkClimate::loop() {
       }
       if (stage_ == Stage::PAIRING)
         enrollment_.transmitted();
-      if (!send_frame(outgoing_)) {
+      if (!start_tx()) {
         ESP_LOGI(TAG, "Trace t=%lu TX refused type=0x%02x stage=%u attempt=%u elapsed=%lu ms", (unsigned long) millis(),
                  outgoing_.data[1], unsigned(stage_), unsigned(attempts_ + 1),
                  (unsigned long) (millis() - transaction_started_ms_));
@@ -1129,13 +1175,13 @@ void RedLinkClimate::loop() {
         break;
       }
       last_tx_us_ = micros();
-      // A query produces ten status copies across successive channels, ending
-      // about 1.36 s after TX. Sending at the old 1 s floor collides with that
-      // train. Keep this guard even without an ACK: missing it proves no failure.
+      // Unacknowledged replies repeat for about 1.36 s. A missed request ACK
+      // does not prove failure: only our timely reply ACK shortens this guard.
       tx_spacing_us_ = outgoing_.data[1] == 0x10 ? 1500000 : 1000000;
       sent_any_ = true;
       attempts_++;
       saw_ack_ = false;
+      reply_ack_attempted_ = false;
       received_status_ = Status{};
       tx_started_ms_ = millis();
       exchange_ = Exchange::TX;

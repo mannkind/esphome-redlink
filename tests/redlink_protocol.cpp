@@ -440,6 +440,8 @@ static void emergency_heat_tests() {
 }
 
 int main() {
+  // Original gateway ACK, decoded after the EIM's status reply in gateway-close-upper.cs8.
+  CHECK(same_frame(status_reply_ack(0x389e, 0xd6e0), from_hex("0d22ffff389ed6e0f00000825228680b")));
   discovery_and_persistence();
   enrollment_tests();
   fresh_identity_tests();

@@ -222,6 +222,7 @@ bool RedLinkRadio::wait_state_(uint8_t state) {
 
 bool RedLinkRadio::enter_idle_() {
   this->disarm_sync_();
+  this->tx_prepared_ = false;
   this->rx_running_ = false;
   return this->strobe_(SIDLE) && this->wait_state_(STATE_IDLE);
 }
@@ -475,7 +476,8 @@ bool RedLinkRadio::read_frame(Frame &frame, uint32_t &sync_start_us) {
       std::memcpy(frame.data.data(), this->rx_frame_.data.data(), frame.size);
       sync_start_us = this->rx_sync_end_us_ - SYNC_DURATION_US;
     }
-    this->begin_rx();
+    if (!valid)
+      this->begin_rx();
     return valid;
   }
   // Low GDO now denotes a hardware packet end, not necessarily an error.
@@ -501,8 +503,9 @@ bool RedLinkRadio::read_frame(Frame &frame, uint32_t &sync_start_us) {
   return false;
 }
 
-bool RedLinkRadio::send_frame(const Frame &frame) {
+bool RedLinkRadio::prepare_frame(const Frame &frame) {
   this->tx_succeeded_ = false;
+  this->tx_prepared_ = false;
   if (receive_only_ || !transmit_enabled_ || !this->initialized_ || this->is_failed() || this->tx_active_ ||
       !hop_.ready() || receive_candidate_ != hop_.active_rank(0) || frame.size < 4 || frame.size > 64 ||
       !valid_frame(frame))
@@ -527,6 +530,21 @@ bool RedLinkRadio::send_frame(const Frame &frame) {
   // The deadline includes 16 preamble bytes + 2 sync bytes + the complete whitened frame.
   this->tx_timeout_us_ =
       ((static_cast<uint32_t>(frame.size) + 18) * 8000000UL + APPROX_BIT_RATE - 1) / APPROX_BIT_RATE + 5000;
+  this->tx_prepared_ = true;
+  return true;
+}
+
+bool RedLinkRadio::start_tx() {
+  const bool prepared = this->tx_prepared_;
+  this->tx_prepared_ = false;
+  if (!prepared || receive_only_ || !transmit_enabled_ || !this->initialized_ || this->is_failed() ||
+      this->tx_active_ || !hop_.ready() || receive_candidate_ != hop_.active_rank(0))
+    return false;
+  {
+    InterruptLock lock;
+    this->sync_pending_ = false;
+    this->sync_armed_ = true;
+  }
   this->tx_started_us_ = micros();
   this->tx_active_ = true;
   return this->strobe_(STX);

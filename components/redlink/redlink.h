@@ -76,6 +76,8 @@ class RedLinkClimate : public RedLinkRadio, public climate::Climate {
   uint16_t network_{0}, gateway_{0};  // Required installation-specific IDs supplied by codegen.
   bool have_clock_{false}, clock_published_{false};
   bool saw_ack_{false}, all_write_acks_{true}, sent_any_{false};
+  bool reply_ack_attempted_{false}, sending_reply_ack_{false};
+  uint32_t reply_end_us_{0};
   bool paired_state_{false}, pairing_saved_{false};
   bool registry_confirmed_{false};
   bool complete_association_{false};

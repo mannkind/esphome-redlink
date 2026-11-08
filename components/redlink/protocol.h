@@ -44,6 +44,7 @@ uint16_t crc16(const uint8_t *data, size_t size);
 void whiten(uint8_t *data, size_t size);
 bool valid_frame(const Frame &frame);
 Frame status_query(uint16_t network, uint16_t gateway);
+Frame status_reply_ack(uint16_t network, uint16_t gateway);
 Frame gateway_discovery(uint16_t gateway);
 Frame gateway_announcement(uint16_t gateway);
 Frame gateway_registration(uint16_t gateway);

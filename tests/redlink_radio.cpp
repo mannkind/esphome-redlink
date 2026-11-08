@@ -302,15 +302,29 @@ static void learned_channel_registers_and_tx_guard() {
   CHECK(radio.receive_candidate_ == 0);
   check_tuning(0);  // Initial RX is candidate channel4/sync636b, not hardcoded slot0/channel10.
   radio.enable_tx();
-  CHECK(!radio.send_frame(status_query(0x389e, 0xb14f)) && tx_strobes == 0);
+  CHECK(!radio.prepare_frame(status_query(0x389e, 0xb14f)) && !radio.start_tx() && tx_strobes == 0);
   for (uint8_t slot = 0; slot < HOP_COUNT; ++slot) {
     CHECK(radio.hop_.observe(slot, 49 - slot, 1000 + slot));
     CHECK(radio.hop_.observe(slot, 49 - slot, 2000 + slot));
   }
-  CHECK(!radio.send_frame(status_query(0x389e, 0xb14f)));  // Wrong physical candidate.
+  CHECK(!radio.prepare_frame(status_query(0x389e, 0xb14f)));  // Wrong physical candidate.
   CHECK(radio.listen_candidate_(49));
   check_tuning(49);
-  CHECK(radio.send_frame(status_query(0x389e, 0xb14f)) && tx_strobes == 1);
+  CHECK(radio.prepare_frame(status_query(0x389e, 0xb14f)) && tx_strobes == 0);
+  radio.set_receive_only(true);
+  CHECK(!radio.start_tx() && tx_strobes == 0);
+  radio.set_receive_only(false);
+  CHECK(!radio.start_tx() && tx_strobes == 0);
+  CHECK(radio.prepare_frame(status_query(0x389e, 0xb14f)));
+  radio.begin_rx();
+  CHECK(!radio.start_tx() && tx_strobes == 0);
+  CHECK(radio.prepare_frame(status_query(0x389e, 0xb14f)));
+  CHECK(radio.listen_candidate_(0));
+  CHECK(!radio.start_tx() && tx_strobes == 0);
+  CHECK(radio.listen_candidate_(49));
+  CHECK(radio.prepare_frame(status_query(0x389e, 0xb14f)));
+  CHECK(radio.start_tx() && tx_strobes == 1);
+  CHECK(!radio.start_tx() && tx_strobes == 1);
   emulate_registers = false;
 }
 
@@ -335,6 +349,8 @@ static void delayed_loop_keeps_buffered_packet(uint32_t start) {
   CHECK(received.size == expected.size);
   CHECK(std::equal(expected.data.begin(), expected.data.begin() + expected.size, received.data.begin()));
   CHECK(sync == expected_sync);
+  CHECK(marcstate == 1);
+  radio.begin_rx();
   // An empty FIFO really has stalled; reset it without accepting a frame.
   radio.delayed_sync(5000);
   CHECK(!radio.read_frame(received, sync));
@@ -399,6 +415,12 @@ static void rearmed(const TestRadio &radio) {
   CHECK(registers[0x08] == 0 && registers[0x06] == 64);
 }
 
+static void resume_after_packet(TestRadio &radio) {
+  CHECK(redlink_test::marcstate == 1);  // The caller can ACK without another RX calibration.
+  radio.begin_rx();
+  rearmed(radio);
+}
+
 static void noisy_tail_preserves_short_packet(uint32_t start) {
   using namespace redlink_test;
   using namespace esphome::redlink;
@@ -419,7 +441,7 @@ static void noisy_tail_preserves_short_packet(uint32_t start) {
     CHECK(radio.read_frame(received, sync));
     same_packet(received, expected);
     CHECK(sync == expected_sync);
-    rearmed(radio);
+    resume_after_packet(radio);
   }
 }
 
@@ -454,7 +476,7 @@ static void streamed_packets_stop_at_declared_length(uint32_t start) {
     CHECK(radio.read_frame(received, sync));
     same_packet(received, expected);
     CHECK(sync == expected_sync);
-    rearmed(radio);
+    resume_after_packet(radio);
   }
 }
 
@@ -488,7 +510,7 @@ static void reject_corrupt_and_overflowed_packets() {
     receive_bytes(wire.data(), wire.size());
     CHECK(radio.read_frame(received, sync));
     same_packet(received, expected);
-    rearmed(radio);
+    resume_after_packet(radio);
   }
 }
 
@@ -606,7 +628,7 @@ static void fifo_observation_and_sync_races(uint32_t start) {
     CHECK(radio.read_frame(received, sync));
     same_packet(received, expected);
     CHECK(sync == expected_sync);
-    rearmed(radio);
+    resume_after_packet(radio);
   }
   TestRadio missing_irq;
   setup_receiver(missing_irq, start);

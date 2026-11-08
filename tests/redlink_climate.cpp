@@ -14,6 +14,7 @@ using namespace esphome::redlink;
 namespace {
 uint64_t now_us = 1000000;
 unsigned transport_sends = 0;
+uint32_t preparation_delay_us = 0;
 }  // namespace
 namespace esphome {
 uint32_t micros() { return now_us; }
@@ -23,13 +24,20 @@ namespace redlink {
 void RedLinkRadio::setup() {}
 void RedLinkRadio::dump_config() {}
 bool RedLinkRadio::read_frame(Frame &, uint32_t &) { return false; }
-bool RedLinkRadio::send_frame(const Frame &) {
+bool RedLinkRadio::prepare_frame(const Frame &) {
+  now_us += preparation_delay_us;
+  return true;
+}
+bool RedLinkRadio::start_tx() {
   ++transport_sends;
   tx_succeeded_ = true;
   return true;
 }
 bool RedLinkRadio::tx_finished() { return true; }
-void RedLinkRadio::begin_rx() {}
+void RedLinkRadio::begin_rx() {
+  sync_pending_ = false;
+  rx_running_ = true;
+}
 bool RedLinkRadio::listen_candidate_(uint8_t rank) {
   if (rank >= HOP_COUNT)
     return false;
@@ -136,6 +144,14 @@ class TestClimate : public RedLinkClimate {
   using RedLinkClimate::recovery_candidate_;
   using RedLinkClimate::recovery_started_ms_;
   using RedLinkClimate::clock_published_;
+  using RedLinkClimate::tx_spacing_us_;
+  using RedLinkClimate::window_started_ms_;
+  using RedLinkClimate::reply_end_us_;
+  using RedLinkClimate::sending_reply_ack_;
+  void transmitted_sync(uint32_t start, bool captured) {
+    sync_end_us_ = start + 417;
+    sync_pending_ = captured;
+  }
   binary_sensor::BinarySensor pending, verified, acknowledged, locked, emergency;
   text_sensor::TextSensor result;
   TestSystemModeSelect system_mode{this};
@@ -1040,6 +1056,7 @@ static void query_reply_train_blocks_next_write(uint64_t start) {
   const unsigned before = transport_sends;
   climate.loop();
   CHECK(transport_sends == before + 1);
+  CHECK(climate.last_tx_us_ == climate.due_us_);
   const uint32_t query_tx = climate.last_tx_us_;
   climate.loop();  // Complete transport; no ACK is injected.
   now_us += 450000;
@@ -1058,6 +1075,7 @@ static void query_reply_train_blocks_next_write(uint64_t start) {
   now_us += static_cast<uint32_t>(climate.due_us_ - micros());
   climate.loop();
   CHECK(transport_sends == before + 2);
+  CHECK(climate.last_tx_us_ == climate.due_us_);
 }
 
 static void recovery_hint_is_receive_only_and_bounded() {
@@ -1088,6 +1106,57 @@ static void recovery_hint_is_receive_only_and_bounded() {
   CHECK(validated.write_count_ == 0);
 }
 
+static void status_reply_ack_is_bounded(uint64_t start) {
+  for (unsigned scenario = 0; scenario < 8; ++scenario) {
+    now_us = start;
+    preparation_delay_us = scenario == 7 ? 5000 : 0;
+    TestClimate climate;
+    climate.stage_ = TestClimate::Stage::BEFORE;
+    climate.begin_exchange_(status_query(0x389e, 0xb14f));
+    climate.exchange_ = TestClimate::Exchange::RX;
+    climate.last_tx_us_ = micros() - 200000;
+    climate.window_started_ms_ = millis() - 180;
+    climate.tx_spacing_us_ = 1500000;
+    Status status = actual();
+    if (scenario == 5)
+      status.thermostat[4] = 0x9a;  // Pending is ACKable, but never verified actual state.
+    Frame frame = reply(status);
+    if (scenario == 2)
+      frame.data[frame.size - 1] ^= 1;
+    if (scenario == 6) {
+      frame.data[4] ^= 1;  // Valid packet for a different gateway.
+      const uint16_t crc = crc16(frame.data.data(), frame.size - 2);
+      frame.data[frame.size - 2] = crc >> 8;
+      frame.data[frame.size - 1] = crc;
+    }
+    const uint32_t duration = 417 + (frame.size * 8000000UL + 38382) / 38383;
+    const uint32_t sync = micros() - duration - (scenario == 1 ? 3000 : 500);
+    const uint32_t query_tx = climate.last_tx_us_;
+    const uint32_t window = climate.window_started_ms_;
+    const unsigned before = transport_sends;
+    climate.received_(frame, sync);
+    const bool should_send = scenario == 0 || scenario == 3 || scenario == 4 || scenario == 5;
+    CHECK(transport_sends == before + unsigned(should_send));
+    CHECK(climate.sending_reply_ack_ == should_send);
+    CHECK(!actual_status(climate.confirmed_status_));  // An ACK is not publication or verification.
+    if (!should_send) {
+      CHECK(climate.tx_spacing_us_ == 1500000);
+      continue;
+    }
+    CHECK(climate.exchange_ == TestClimate::Exchange::TX);
+    CHECK(actual_status(climate.received_status_) == (scenario != 5));
+    climate.transmitted_sync(climate.reply_end_us_ + (scenario == 3 ? 6500 : 5000), scenario != 4);
+    now_us += 20000;
+    climate.loop();
+    CHECK(!climate.sending_reply_ack_ && climate.exchange_ == TestClimate::Exchange::RX);
+    CHECK(climate.last_tx_us_ == query_tx && climate.window_started_ms_ == window);
+    CHECK(climate.tx_spacing_us_ == (scenario == 0 || scenario == 5 ? 500000U : 1500000U));
+    climate.received_(frame, sync);
+    CHECK(transport_sends == before + 1);  // No duplicate ACK for the same query.
+  }
+  preparation_delay_us = 0;
+}
+
 int main() {
   recovery_hint_is_receive_only_and_bounded();
   cold_scanner_learns_unknown_order();
@@ -1113,7 +1182,12 @@ int main() {
   stale_prewrite_reply(1000000);
   stale_prewrite_reply(200);  // Timestamp comparison remains valid across micros() wrap.
   CHECK(transport_sends == 0);
+  // Reproduce preparation slower than the entire allowed lateness window.
+  // Both normal and wrapping clocks must still reach STX on the chosen deadline.
+  preparation_delay_us = 5000;
   query_reply_train_blocks_next_write(1000000);
   query_reply_train_blocks_next_write(0xffffffffULL - 600000);
+  status_reply_ack_is_bounded(1000000);
+  status_reply_ack_is_bounded(0xffffffffULL + 1000);
   std::puts("RedLINK climate control tests passed");
 }

@@ -236,6 +236,11 @@ Frame status_query(uint16_t network, uint16_t gateway) {
   return frame;
 }
 
+Frame status_reply_ack(uint16_t network, uint16_t gateway) {
+  // Captured gateway ACK body; the final byte varies and its meaning is unconfirmed.
+  return block_frame(0x22, std::array<uint8_t, 3>{0x82, 0x52, 0x28}, network, gateway);
+}
+
 Frame gateway_discovery(uint16_t gateway) {
   return block_frame(0x33, std::array<uint8_t, 2>{0x81, 0x11}, 0xfffe, gateway);
 }

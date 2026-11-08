@@ -24,10 +24,13 @@ class RedLinkRadio : public Component,
   void set_radio_healthy_sensor(binary_sensor::BinarySensor *value) { radio_healthy_ = value; }
 
   // Short RX frames are hardware-bounded; >64-byte frames need frequent FIFO service.
-  // RX is rearmed after every packet/error, with the original ISR sync timestamp retained.
+  // A valid frame leaves IDLE for a prompt reply; otherwise RX is rearmed automatically.
+  // After a valid frame, the caller must start TX or call begin_rx().
   bool read_frame(Frame &frame, uint32_t &sync_start_us);
-  // Starts fixed-length TX; never waits for the packet to finish. Call begin_rx() after tx_finished().
-  bool send_frame(const Frame &frame);
+  // Queue and validate before the timed slot. Any RX/retune invalidates preparation.
+  bool prepare_frame(const Frame &frame);
+  // Only strobes STX; never waits for completion. Call begin_rx() after tx_finished().
+  bool start_tx();
   bool tx_finished();
   bool tx_succeeded() const { return tx_succeeded_; }
   void begin_rx();
@@ -63,6 +66,7 @@ class RedLinkRadio : public Component,
   bool rx_running_{false};
   bool rx_active_{false};
   bool tx_active_{false};
+  bool tx_prepared_{false};
   bool rx_infinite_{false};
   bool tx_succeeded_{false};
   uint32_t tx_started_us_{0};

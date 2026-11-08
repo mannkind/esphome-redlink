@@ -9,6 +9,8 @@ esp32:
     type: esp-idf
 
 logger:
+  level: INFO
+  baud_rate: 0 # Keep API logs without blocking on an unused serial console.
 
 wifi:
   ssid: "REPLACE_WITH_YOUR_WIFI_SSID"

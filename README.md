@@ -76,8 +76,8 @@ beyond hours; a short rehearsal proves reception, not completion of all 50 slots
 
 Targets update optimistically in Home Assistant, then readback confirms them.
 After boot, climate state stays unknown until the first actual readback.
-Radio commands aren't instant: the EIM repeats status replies across channels, so
-I leave 1.5 seconds after a query before transmitting again.
+Commands aren't instant; the thermostat still has its own radio cycle.
+I acknowledge status replies promptly so the EIM can stop repeating them.
 I haven't decoded actual heating/cooling activity.
 The thermostat and EIM still control the equipment; this isn't a safety controller.
 
